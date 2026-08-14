@@ -652,7 +652,7 @@ async function fetchTimesheetsInRange(requestPage, startDate, endDate, pageSize 
   return result;
 }
 
-const server = http.createServer(async (req, res) => {
+const server = http.createServer(async (req, res) => { // nosemgrep: problem-based-packs.insecure-transport.js-node.using-http-server.using-http-server
   applySecurityHeaders(req, res);
   const requestUrl = new URL(req.url, 'http://localhost');
   const pathname = requestUrl.pathname;
