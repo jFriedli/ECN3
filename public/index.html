@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ECN3 – Zeiterfassung</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@event-calendar/build@5.6.1/dist/event-calendar.min.css">
+  <style>
+    /* Global reset */
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 0;
+      background: #fafafa;
+    }
+    h1, h2 {
+      margin: 0;
+      font-weight: normal;
+    }
+    /* Login screen */
+    #login-screen {
+      display: none;
+      text-align: center;
+      padding-top: 60px;
+    }
+    #login-screen img {
+      max-width: 180px;
+      margin: 15px;
+    }
+    #login-screen .login-btn {
+      display: inline-block;
+      padding: 12px 24px;
+      background: #0070c0;
+      color: #fff;
+      text-decoration: none;
+      border-radius: 4px;
+      font-size: 16px;
+      margin-top: 20px;
+    }
+    /* App */
+    #app {
+      display: none;
+      /* Use full width and height to let the calendar fill the page */
+      max-width: 100%;
+      margin: 0;
+      padding: 0 10px 20px;
+      box-sizing: border-box;
+    }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 20px 0 10px;
+      flex-wrap: wrap;
+    }
+    .controls button,
+    .controls select {
+      padding: 6px 10px;
+      font-size: 14px;
+      border: 1px solid #ccc;
+      border-radius: 3px;
+      background: #fff;
+      cursor: pointer;
+    }
+    .controls button:hover {
+      background: #f0f0f0;
+    }
+    .controls select {
+      min-width: 120px;
+    }
+    /* Calendar container */
+    #ec {
+      /* Contain the calendar within a fixed height with its own scroll */
+      height: calc(100vh - 210px);
+      overflow-y: auto;
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+    }
+    /* Modal overlay */
+    .modal-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0, 0, 0, 0.5);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+    .modal {
+      background: #fff;
+      padding: 20px;
+      border-radius: 6px;
+      width: 100%;
+      max-width: 600px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    }
+    .modal h2 {
+      margin-top: 0;
+      margin-bottom: 10px;
+    }
+    .modal label {
+      display: block;
+      margin-top: 10px;
+      font-size: 14px;
+    }
+    .modal input,
+    .modal select,
+    .modal textarea {
+      width: 100%;
+      padding: 6px 8px;
+      box-sizing: border-box;
+      font-size: 14px;
+      border: 1px solid #ccc;
+      border-radius: 3px;
+      margin-top: 4px;
+    }
+    .modal textarea {
+      resize: vertical;
+    }
+    .modal-buttons {
+      margin-top: 15px;
+      text-align: right;
+    }
+    .modal-buttons button {
+      padding: 6px 12px;
+      font-size: 14px;
+      border: none;
+      border-radius: 3px;
+      cursor: pointer;
+    }
+    /* Delete button (red) appears when editing existing entry) */
+    #delete-btn {
+      background: #f44336;
+      color: #fff;
+      margin-right: 8px;
+    }
+    /* Cancel button (gray) */
+    #cancel-btn {
+      background: #888;
+      color: #fff;
+      margin-right: 8px;
+    }
+    /* Save button (blue) */
+    #save-btn {
+      background: #0070c0;
+      color: #fff;
+    }
+
+    /* New grid layout for modal content */
+    .modal-grid {
+      display: flex;
+      gap: 20px;
+      margin-top: 10px;
+    }
+    .modal-left {
+      flex: 2;
+    }
+    .modal-right {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+    }
+    .contact-box {
+      background: #f7f7f7;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 12px;
+      margin-top: 10px;
+    }
+    .contact-box h3 {
+      margin: 0 0 8px;
+      font-size: 14px;
+      color: #333;
+    }
+
+    /* Dark mode overrides for contact box */
+    body.ec-dark .contact-box {
+      background: #333;
+      border-color: #555;
+    }
+    body.ec-dark .contact-box h3 {
+      color: #ddd;
+    }
+
+    /* Project search input styling */
+    #project-input {
+      padding: 8px 12px;
+      border: 1px solid #bbb;
+      border-radius: 6px;
+      font-size: 14px;
+      width: 100%;
+      box-sizing: border-box;
+      background: #fcfcfc;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    #project-input:focus {
+      border-color: #0070c0;
+      box-shadow: 0 0 0 2px rgba(0,112,192,0.2);
+      outline: none;
+    }
+    body.ec-dark #project-input {
+      background: #333;
+      border-color: #555;
+      color: #e0e0e0;
+    }
+    body.ec-dark #project-input:focus {
+      border-color: #3399ff;
+      box-shadow: 0 0 0 2px rgba(51,153,255,0.4);
+    }
+    /* Dark mode styles */
+    body.ec-dark {
+      background: #1f1f1f;
+      color: #e0e0e0;
+    }
+    body.ec-dark #ec {
+      background: #2a2a2a;
+      border-color: #444;
+    }
+    body.ec-dark .controls button,
+    body.ec-dark .controls select {
+      background: #3a3a3a;
+      color: #e0e0e0;
+      border-color: #555;
+    }
+    body.ec-dark .modal {
+      background: #2a2a2a;
+      color: #e0e0e0;
+    }
+    body.ec-dark .modal input,
+    body.ec-dark .modal select,
+    body.ec-dark .modal textarea {
+      background: #3a3a3a;
+      border-color: #555;
+      color: #e0e0e0;
+    }
+    body.ec-dark #login-screen .login-btn {
+      background: #005a99;
+    }
+
+    /* Day header row displayed above the calendar. Shows the date and total hours
+       booked for each day. This row remains visible when the calendar is scrolled.
+       We use a CSS grid with five equal columns for the work days Monday–Friday. */
+    .day-header {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      border-bottom: 1px solid #444;
+      background: #2a2a2a;
+      color: #e0e0e0;
+      font-size: 13px;
+      line-height: 1.2;
+      padding: 4px 0;
+      margin: 0;
+      /* Stick the header to the top of the scroll container */
+      position: sticky;
+      top: 0;
+      z-index: 3;
+    }
+    .day-header-cell {
+      text-align: center;
+      padding: 2px 4px;
+    }
+    .day-header-cell .day-date {
+      font-weight: bold;
+      display: block;
+    }
+    .day-header-cell .day-total {
+      font-size: 12px;
+      color: #b0b0b0;
+    }
+
+    /* Suggestions dropdown for project search */
+    #project-search-container .suggestions {
+      position: absolute;
+      left: 0;
+      right: 0;
+      background: #fff;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+      max-height: 200px;
+      overflow-y: auto;
+      z-index: 10000;
+    }
+    #project-search-container .suggestion-item {
+      padding: 4px 8px;
+      cursor: pointer;
+    }
+    #project-search-container .suggestion-item:hover {
+      background: #f0f0f0;
+    }
+    body.ec-dark #project-search-container .suggestions {
+      background: #2a2a2a;
+      border-color: #555;
+    }
+    body.ec-dark #project-search-container .suggestion-item {
+      color: #e0e0e0;
+    }
+    body.ec-dark #project-search-container .suggestion-item:hover {
+      background: #3a3a3a;
+    }
+
+    /* Override EventCalendar CSS variables in dark mode to improve contrast. */
+    body.ec-dark {
+      --ec-bg-color: #1f1f1f;
+      --ec-text-color: #e0e0e0;
+      --ec-border-color: #555;
+      --ec-header-bg-color: #2a2a2a;
+      --ec-header-text-color: #e0e0e0;
+    }
+  </style>
+</head>
+<body>
+  <!-- Login screen (shown when not authenticated) -->
+  <div id="login-screen">
+    <!-- Company logo displayed prominently -->
+    <img id="company-logo" src="company-logo.png" alt="ECN3 Firmenlogo" style="max-width:3000px;">
+    <!-- Login area: prompt and clickable Bexio logo -->
+    <div style="display:flex;flex-direction:column;align-items:center;gap:10px;">
+      <span style="font-size:18px;font-weight:600;">Log in via</span>
+      <!-- Clicking the Bexio logo initiates the OAuth login -->
+      <a href="/auth/login" style="display:inline-block;">
+        <img id="bexio-logo" src="bexio-logo.png" alt="Bexio Login" style="max-width:200px;">
+      </a>
+    </div>
+  </div>
+
+  <!-- Main app (hidden until authenticated) -->
+  <div id="app">
+    <!-- Control bar: week navigation, slot duration selector, dark mode toggle -->
+    <div class="controls">
+      <button id="prev-btn">&laquo;</button>
+      <button id="today-btn">Today</button>
+      <button id="next-btn">&raquo;</button>
+      <span id="current-range" style="margin-left:10px;font-weight:bold;"></span>
+      <!-- Multi‑day planner button.  Opens a modal allowing the user to create
+           entries across multiple days with a single action. -->
+      <button id="multi-day-btn" style="margin-left:auto;">Multi‑Day Planner</button>
+      <!-- Removed time slot picker and dark mode toggle for simplicity -->
+    </div>
+    <!-- Calendar container including sticky day header -->
+    <div id="ec">
+      <!-- Day header row: displays day names and total booked hours for each day.
+           It is placed inside the scroll container so that it sticks to the top
+           when scrolling. -->
+      <div id="day-header" class="day-header"></div>
+    </div>
+  </div>
+
+  <!-- Modal for creating/editing events -->
+  <div class="modal-overlay" id="event-modal">
+    <div class="modal">
+      <h2 id="modal-title">Time entry</h2>
+      <form id="event-form">
+        <input type="hidden" id="timesheet-id">
+        <!-- Use a grid layout to separate general fields from contact information -->
+        <div class="modal-grid">
+          <!-- Left column: core entry fields -->
+          <div class="modal-left">
+            <label for="start-time">Start time</label>
+            <input type="text" id="start-time" placeholder="YYYY-MM-DD HH:MM">
+            <label for="end-time">End time</label>
+            <input type="text" id="end-time" placeholder="YYYY-MM-DD HH:MM">
+            <label for="project-input">Project</label>
+            <!-- Custom project search with suggestions -->
+            <div id="project-search-container" style="position:relative;">
+              <input type="text" id="project-input" placeholder="Search project" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+              <div id="project-suggestions" class="suggestions" style="display:none"></div>
+            </div>
+            <input type="hidden" id="project-id">
+
+            <label for="activity-select">Activity</label>
+            <select id="activity-select">
+              <option value="">-- select activity --</option>
+            </select>
+            <label for="package-select">Work package</label>
+            <select id="package-select">
+              <option value="">-- select package --</option>
+            </select>
+            <label for="status-select">Status</label>
+            <select id="status-select">
+              <option value="">-- select status --</option>
+            </select>
+            <label for="remark-input">Remark</label>
+            <textarea id="remark-input" rows="3"></textarea>
+          </div>
+          <!-- Right column: customer and contact person information -->
+          <div class="modal-right">
+            <div class="contact-box">
+              <h3>Customer &amp; Contact</h3>
+              <label for="contact-name">Customer</label>
+              <input type="text" id="contact-name" placeholder="Customer" disabled>
+              <input type="hidden" id="contact-id">
+              <label for="sub-contact-name">Contact person</label>
+              <input type="text" id="sub-contact-name" placeholder="Contact person" disabled>
+              <input type="hidden" id="sub-contact-id">
+            </div>
+          </div>
+        </div>
+        <div class="modal-buttons">
+          <!-- Delete button visible when editing an existing event -->
+          <button type="button" id="delete-btn" style="background:#f44336;color:#fff;display:none">Delete</button>
+          <button type="button" id="cancel-btn" style="background:#888;color:#fff">Cancel</button>
+          <button type="submit" id="save-btn" style="background:#0070c0;color:#fff">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal for multi‑day planner -->
+  <div class="modal-overlay" id="multi-modal">
+    <div class="modal">
+      <h2>Multi‑day Planner</h2>
+      <form id="multi-form">
+        <label for="multi-start-date">Start date</label>
+        <input type="date" id="multi-start-date">
+        <label for="multi-end-date">End date</label>
+        <input type="date" id="multi-end-date">
+        <label for="multi-activity-select">Activity</label>
+        <select id="multi-activity-select">
+          <option value="">-- select activity --</option>
+        </select>
+        <div class="modal-buttons">
+          <button type="button" id="multi-cancel-btn" style="background:#888;color:#fff">Cancel</button>
+          <button type="submit" id="multi-save-btn" style="background:#0070c0;color:#fff">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Include EventCalendar bundle -->
+  <script src="https://cdn.jsdelivr.net/npm/@event-calendar/build@5.6.1/dist/event-calendar.min.js"></script>
+  <script src="./main.js"></script>
+</body>
+</html>

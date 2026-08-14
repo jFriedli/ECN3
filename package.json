@@ -1,0 +1,16 @@
+{
+  "name": "test",
+  "version": "1.0.0",
+  "description": "This project – **EzEntry** – implements a simple week‑view calendar UI that integrates with the Bexio REST API.  It allows you to see existing time entries, create new entries by selecting a time range on the calendar, edit existing entries, and delete them.  The UI is similar to the Outlook or Google calendar and is localised in German.",
+  "main": "server.js",
+  "scripts": {
+    "test": "node --test",
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^17.4.2"
+  }
+}
