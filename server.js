@@ -14,41 +14,80 @@ require('dotenv').config();
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const url = require('url');
+const crypto = require('crypto');
 
-// OAuth2.0 configuration.  To use personal API tokens instead of OAuth, set
-// BEXIO_TOKEN.  Otherwise supply the client credentials and redirect URI.
-// Load environment variables from a .env file if present.  We avoid requiring
-// an external dependency such as 'dotenv' by reading the file manually.  If
-// 'dotenv' is installed, we still prefer to use it; otherwise fallback.
-try {
-  // Attempt to load dotenv if available (install via `npm install dotenv`)
-  const dotenv = require('dotenv');
-  dotenv.config();
-} catch (err) {
-  // Fallback: simple .env parser.  Reads key=value pairs line by line.
-  const envFile = path.join(__dirname, '.env');
-  if (fs.existsSync(envFile)) {
-    const lines = fs.readFileSync(envFile, 'utf8').split(/\r?\n/);
-    lines.forEach((line) => {
-      const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]+)\s*=\s*(.*)$/);
-      if (m) {
-        const key = m[1];
-        let val = m[2].trim();
-        // Remove surrounding quotes if present
-        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-          val = val.substring(1, val.length - 1);
-        }
-        process.env[key] = val;
-      }
-    });
+function loadConfig(env = process.env) {
+  const nodeEnv = env.NODE_ENV || 'development';
+  const isProduction = nodeEnv === 'production';
+  const host = env.HOST || '127.0.0.1';
+  const portText = env.PORT || '3000';
+  if (!/^\d+$/.test(portText) || Number(portText) < 1 || Number(portText) > 65535) {
+    throw new Error('PORT must be an integer between 1 and 65535');
   }
+  const port = Number(portText);
+
+  if (env.TRUST_PROXY && !['true', 'false'].includes(env.TRUST_PROXY)) {
+    throw new Error('TRUST_PROXY must be either true or false');
+  }
+  const trustProxy = env.TRUST_PROXY === 'true';
+  if (trustProxy && host !== '127.0.0.1') {
+    throw new Error('TRUST_PROXY=true requires HOST=127.0.0.1');
+  }
+
+  if (isProduction && !env.APP_BASE_URL) {
+    throw new Error('APP_BASE_URL is required in production');
+  }
+  const appBaseUrlText = env.APP_BASE_URL || `http://${host}:${port}`;
+  let appBaseUrl;
+  try {
+    appBaseUrl = new URL(appBaseUrlText);
+  } catch (_) {
+    throw new Error('APP_BASE_URL must be a valid absolute HTTP(S) URL');
+  }
+  if (!['http:', 'https:'].includes(appBaseUrl.protocol) || appBaseUrl.username ||
+      appBaseUrl.password || appBaseUrl.search || appBaseUrl.hash ||
+      !appBaseUrl.hostname || !['', '/'].includes(appBaseUrl.pathname)) {
+    throw new Error('APP_BASE_URL must be an HTTP(S) origin without credentials, path, query, or fragment');
+  }
+  if (isProduction && appBaseUrl.protocol !== 'https:') {
+    throw new Error('APP_BASE_URL must use HTTPS in production');
+  }
+
+  const idleText = env.SESSION_IDLE_TIMEOUT_MS || '1800000';
+  const absoluteText = env.SESSION_ABSOLUTE_TIMEOUT_MS || '43200000';
+  if (!/^\d+$/.test(idleText) || !/^\d+$/.test(absoluteText)) {
+    throw new Error('Session timeouts must be positive integer milliseconds');
+  }
+  const sessionIdleMs = Number(idleText);
+  const sessionAbsoluteMs = Number(absoluteText);
+  if (!Number.isSafeInteger(sessionIdleMs) || sessionIdleMs <= 0 ||
+      !Number.isSafeInteger(sessionAbsoluteMs) || sessionAbsoluteMs <= sessionIdleMs) {
+    throw new Error('SESSION_ABSOLUTE_TIMEOUT_MS must exceed a positive SESSION_IDLE_TIMEOUT_MS');
+  }
+
+  return Object.freeze({
+    nodeEnv,
+    isProduction,
+    host,
+    port,
+    appBaseUrl: appBaseUrl.origin,
+    oauthRedirectUri: new URL('/auth/callback', appBaseUrl.origin).href,
+    secureCookies: appBaseUrl.protocol === 'https:',
+    trustProxy,
+    sessionIdleMs,
+    sessionAbsoluteMs,
+  });
 }
+
+const CONFIG = loadConfig();
+
+// OAuth2.0 configuration. To use personal API tokens for trusted local
+// development, set BEXIO_TOKEN. Otherwise supply OAuth client configuration.
 
 const BEXIO_TOKEN = process.env.BEXIO_TOKEN || '';
 const BEXIO_CLIENT_ID = process.env.BEXIO_CLIENT_ID || '';
 const BEXIO_CLIENT_SECRET = process.env.BEXIO_CLIENT_SECRET || '';
-const BEXIO_REDIRECT_URI = process.env.BEXIO_REDIRECT_URI || '';
+const BEXIO_REDIRECT_URI = CONFIG.oauthRedirectUri;
 
 // Scopes requested during OAuth login.  Can be overridden via env.
 const BEXIO_SCOPES = process.env.BEXIO_SCOPES ||
@@ -57,6 +96,20 @@ const BEXIO_SCOPES = process.env.BEXIO_SCOPES ||
 // Optional: default user ID for timesheet creation.  Set BEXIO_USER_ID in
 // .env to automatically assign the current user when creating timesheets.
 const BEXIO_USER_ID = process.env.BEXIO_USER_ID || '';
+const IS_PRODUCTION = CONFIG.isProduction;
+const SESSION_IDLE_MS = CONFIG.sessionIdleMs;
+const SESSION_ABSOLUTE_MS = CONFIG.sessionAbsoluteMs;
+const configuredSessionSecret = process.env.SESSION_SECRET || '';
+
+if (IS_PRODUCTION && configuredSessionSecret.length < 32) {
+  throw new Error('SESSION_SECRET must contain at least 32 characters in production');
+}
+if (IS_PRODUCTION && BEXIO_TOKEN) {
+  throw new Error('BEXIO_TOKEN shared-auth mode is not permitted in production; configure OAuth');
+}
+// Development may use an ephemeral signing key. Production must provide a
+// stable high-entropy secret so cookie signatures survive process restarts.
+const SESSION_SECRET = configuredSessionSecret || crypto.randomBytes(32).toString('hex');
 
 // In‑memory storage for access/refresh tokens and expiry for a single user.
 // This object previously stored the globally authenticated user's tokens.
@@ -77,7 +130,30 @@ const oauthTokens = {
 // /auth/callback, a new session is created and stored here.  Subsequent
 // API requests identify the session via a `session_id` cookie.  In a
 // production environment, consider using a persistent store.
-const sessions = {};
+const sessions = Object.create(null);
+const loginAttempts = new Map();
+
+const sessionCleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [sessionId, session] of Object.entries(sessions)) {
+    if (now >= session.absolute_expires_at || now - session.last_seen_at >= SESSION_IDLE_MS) {
+      delete sessions[sessionId];
+    }
+  }
+}, Math.min(SESSION_IDLE_MS, 5 * 60 * 1000));
+sessionCleanupTimer.unref();
+
+function allowLoginAttempt(req, now = Date.now()) {
+  const key = req.socket.remoteAddress || 'unknown';
+  const windowMs = 15 * 60 * 1000;
+  const current = loginAttempts.get(key);
+  if (!current || now - current.startedAt >= windowMs) {
+    loginAttempts.set(key, { startedAt: now, count: 1 });
+    return true;
+  }
+  current.count += 1;
+  return current.count <= 20;
+}
 
 // Parse cookies from the request headers.  Returns an object mapping
 // cookie names to values.  If no cookies are present, returns {}.
@@ -88,9 +164,62 @@ function parseCookies(cookieHeader) {
     const parts = cookie.split('=');
     const name = parts[0].trim();
     const val = parts.slice(1).join('=').trim();
-    if (name) cookies[name] = decodeURIComponent(val);
+    if (name) {
+      try {
+        cookies[name] = decodeURIComponent(val);
+      } catch (_) {
+        // Ignore malformed cookie values.
+      }
+    }
   });
   return cookies;
+}
+
+function signValue(value) {
+  return crypto.createHmac('sha256', SESSION_SECRET).update(value).digest('base64url');
+}
+
+function signedSessionCookie(sessionId) {
+  return `${sessionId}.${signValue(sessionId)}`;
+}
+
+function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  return a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+function readSessionId(req) {
+  const value = parseCookies(req.headers.cookie || '').session_id;
+  if (!value) return null;
+  const separator = value.lastIndexOf('.');
+  if (separator < 1) return null;
+  const sessionId = value.slice(0, separator);
+  const signature = value.slice(separator + 1);
+  const expected = signValue(sessionId);
+  if (signature.length !== expected.length ||
+      !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null;
+  return sessionId;
+}
+
+function cookieAttributes(maxAgeSeconds, secure = CONFIG.secureCookies) {
+  return `Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${secure ? '; Secure' : ''}`;
+}
+
+function createSession(values, now = Date.now()) {
+  const sessionId = crypto.randomBytes(32).toString('base64url');
+  sessions[sessionId] = {
+    ...values,
+    created_at: now,
+    last_seen_at: now,
+    absolute_expires_at: now + SESSION_ABSOLUTE_MS,
+  };
+  return sessionId;
+}
+
+function destroySession(req) {
+  const sessionId = readSessionId(req);
+  if (sessionId) delete sessions[sessionId];
+  return sessionId;
 }
 
 // Get the session object associated with the request.  Looks for a
@@ -98,12 +227,54 @@ function parseCookies(cookieHeader) {
 // `sessions`.  If no session exists, returns null.  Does not create
 // sessions.
 function getSession(req) {
-  const cookies = parseCookies(req.headers.cookie || '');
-  const sid = cookies.session_id;
-  if (sid && sessions[sid]) {
-    return sessions[sid];
+  const sid = readSessionId(req);
+  const session = sid && sessions[sid];
+  if (!session) return null;
+  const now = Date.now();
+  if (now >= session.absolute_expires_at || now - session.last_seen_at >= SESSION_IDLE_MS) {
+    delete sessions[sid];
+    return null;
   }
-  return null;
+  session.last_seen_at = now;
+  return session;
+}
+
+function isAuthenticated(req) {
+  // Personal-token mode is retained for trusted local development only and
+  // is prohibited by the production startup checks above.
+  return Boolean(BEXIO_TOKEN || getSession(req));
+}
+
+function applySecurityHeaders(req, res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  res.setHeader('Content-Security-Policy', [
+    "default-src 'self'",
+    "script-src 'self' https://cdn.jsdelivr.net",
+    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net",
+    "img-src 'self' data:",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+  ].join('; '));
+  const forwardedHttps = CONFIG.trustProxy && req.headers['x-forwarded-proto'] === 'https';
+  if (IS_PRODUCTION && (req.socket.encrypted || forwardedHttps)) {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+}
+
+function isSameOriginRequest(req) {
+  const fetchSite = req.headers['sec-fetch-site'];
+  if (fetchSite && !['same-origin', 'same-site', 'none'].includes(fetchSite)) return false;
+  const origin = req.headers.origin;
+  if (!origin) return true; // Non-browser clients; browsers send Origin for these requests.
+  const forwardedProto = CONFIG.trustProxy ? req.headers['x-forwarded-proto'] : null;
+  const protocol = forwardedProto || (req.socket.encrypted ? 'https' : 'http');
+  return origin === `${protocol}://${req.headers.host}`;
 }
 
 // Obtain an access token for the current request.  This checks for a
@@ -338,13 +509,26 @@ async function bexioRequestV3(method, endpoint, queryParams = {}, body = null, r
 }
 
 // Parse JSON body of request.
-function parseBody(req) {
+function parseBody(req, maxBytes = 64 * 1024) {
   return new Promise((resolve, reject) => {
     let data = '';
+    let received = 0;
+    let tooLarge = false;
     req.on('data', chunk => {
+      if (tooLarge) return;
+      received += chunk.length;
+      if (received > maxBytes) {
+        tooLarge = true;
+        const error = new Error('Request body too large');
+        error.statusCode = 413;
+        reject(error);
+        req.resume();
+        return;
+      }
       data += chunk;
     });
     req.on('end', () => {
+      if (tooLarge) return;
       if (!data) {
         return resolve(null);
       }
@@ -352,10 +536,66 @@ function parseBody(req) {
         const parsed = JSON.parse(data);
         resolve(parsed);
       } catch (e) {
-        reject(e);
+        const error = new Error('Malformed JSON');
+        error.statusCode = 400;
+        reject(error);
       }
     });
   });
+}
+
+function validId(value, optional = false) {
+  if (optional && (value === '' || value === null || value === undefined)) return true;
+  return (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) ||
+    (typeof value === 'string' && /^[1-9]\d{0,15}$/.test(value));
+}
+
+function validateTimesheetBody(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    const error = new Error('Request body must be a JSON object');
+    error.statusCode = 400;
+    throw error;
+  }
+  for (const field of ['client_service_id', 'status_id']) {
+    if (!validId(body[field])) {
+      const error = new Error(`${field} must be a positive numeric ID`);
+      error.statusCode = 400;
+      throw error;
+    }
+  }
+  for (const field of ['pr_project_id', 'pr_package_id', 'contact_id', 'sub_contact_id', 'user_id']) {
+    if (!validId(body[field], true)) {
+      const error = new Error(`${field} must be a numeric ID or empty`);
+      error.statusCode = 400;
+      throw error;
+    }
+  }
+  if (body.text !== undefined && (typeof body.text !== 'string' || body.text.length > 2000)) {
+    const error = new Error('text must be a string of at most 2000 characters');
+    error.statusCode = 400;
+    throw error;
+  }
+  const tracking = body.tracking;
+  if (!tracking || typeof tracking !== 'object' || Array.isArray(tracking) || tracking.type !== 'range' ||
+      typeof tracking.start !== 'string' || typeof tracking.end !== 'string' ||
+      !Number.isFinite(Date.parse(tracking.start)) || !Number.isFinite(Date.parse(tracking.end)) ||
+      Date.parse(tracking.end) <= Date.parse(tracking.start)) {
+    const error = new Error('tracking must contain a valid range with start before end');
+    error.statusCode = 400;
+    throw error;
+  }
+  return {
+    pr_project_id: body.pr_project_id || null,
+    client_service_id: body.client_service_id,
+    pr_package_id: body.pr_package_id || null,
+    status_id: body.status_id,
+    text: body.text || '',
+    tracking: { type: 'range', start: tracking.start, end: tracking.end },
+    contact_id: body.contact_id || null,
+    sub_contact_id: body.sub_contact_id || null,
+    ...(body.user_id ? { user_id: body.user_id } : {}),
+    ...(typeof body.allowable_bill === 'boolean' ? { allowable_bill: body.allowable_bill } : {}),
+  };
 }
 
 const TIMESHEET_PAGE_SIZE = 500;
@@ -413,15 +653,22 @@ async function fetchTimesheetsInRange(requestPage, startDate, endDate, pageSize 
 }
 
 const server = http.createServer(async (req, res) => {
-  const parsedUrl = url.parse(req.url, true);
-  const pathname = parsedUrl.pathname;
+  applySecurityHeaders(req, res);
+  const requestUrl = new URL(req.url, 'http://localhost');
+  const pathname = requestUrl.pathname;
+  const parsedUrl = { query: Object.fromEntries(requestUrl.searchParams) };
 
   // OAuth login route.  Redirects the user to the Bexio auth page.  Only
   // enabled when client credentials are supplied.
   if (pathname === '/auth/login' && req.method === 'GET') {
-    if (!BEXIO_CLIENT_ID || !BEXIO_CLIENT_SECRET || !BEXIO_REDIRECT_URI) {
+    if (!allowLoginAttempt(req)) {
+      res.writeHead(429, { 'Content-Type': 'text/plain', 'Retry-After': '900' });
+      res.end('Too many authentication attempts');
+      return;
+    }
+    if (!BEXIO_CLIENT_ID || !BEXIO_CLIENT_SECRET) {
       res.writeHead(500, { 'Content-Type': 'text/plain' });
-      res.end('OAuth configuration missing. Please set BEXIO_CLIENT_ID, BEXIO_CLIENT_SECRET and BEXIO_REDIRECT_URI.');
+      res.end('OAuth configuration missing. Please set BEXIO_CLIENT_ID and BEXIO_CLIENT_SECRET.');
       return;
     }
     // Build authorization URL
@@ -430,22 +677,34 @@ const server = http.createServer(async (req, res) => {
     params.append('response_type', 'code');
     params.append('redirect_uri', BEXIO_REDIRECT_URI);
     params.append('scope', BEXIO_SCOPES);
-    // Set a simple state parameter (could be improved).
-    const state = Math.random().toString(36).substring(2);
+    const state = crypto.randomBytes(32).toString('base64url');
     params.append('state', state);
     const authUrl = `https://auth.bexio.com/realms/bexio/protocol/openid-connect/auth?${params.toString()}`;
     // Redirect user to Bexio login
-    res.writeHead(302, { Location: authUrl });
+    res.writeHead(302, {
+      Location: authUrl,
+      'Set-Cookie': `oauth_state=${state}.${signValue(state)}; ${cookieAttributes(600)}`,
+    });
     res.end();
     return;
   }
 
   // OAuth callback route.  Handles the authorization code and exchanges it for tokens.
   if (pathname === '/auth/callback' && req.method === 'GET') {
-    const { code } = parsedUrl.query;
-    if (!code) {
+    if (!allowLoginAttempt(req)) {
+      res.writeHead(429, { 'Content-Type': 'text/plain', 'Retry-After': '900' });
+      res.end('Too many authentication attempts');
+      return;
+    }
+    const { code, state } = parsedUrl.query;
+    const stateCookie = parseCookies(req.headers.cookie || '').oauth_state || '';
+    const separator = stateCookie.lastIndexOf('.');
+    const cookieState = separator > 0 ? stateCookie.slice(0, separator) : '';
+    const cookieSignature = separator > 0 ? stateCookie.slice(separator + 1) : '';
+    const validState = safeEqual(state, cookieState) && safeEqual(cookieSignature, signValue(cookieState));
+    if (!code || !validState) {
       res.writeHead(400, { 'Content-Type': 'text/plain' });
-      res.end('Missing authorization code');
+      res.end('Invalid authentication response');
       return;
     }
     try {
@@ -465,23 +724,23 @@ const server = http.createServer(async (req, res) => {
         },
       );
       if (!tokenRes.ok) {
-        const text = await tokenRes.text();
-        throw new Error(
-          `Token exchange failed: ${tokenRes.status} ${tokenRes.statusText} – ${text}`,
-        );
+        throw new Error(`Token exchange failed with status ${tokenRes.status}`);
       }
       const json = await tokenRes.json();
+      if (!json || typeof json.access_token !== 'string' || json.access_token.length === 0) {
+        throw new Error('Token response did not contain an access token');
+      }
       // Create a new session for this user.  Generate a simple random
       // identifier and store the tokens, expiry and user_id in the sessions
       // object.  Also update the global oauthTokens as a fallback for
       // environments where sessions are not used.
-      const newSessionId = Math.random().toString(36).substring(2) + Date.now().toString(36);
-      sessions[newSessionId] = {
+      destroySession(req);
+      const newSessionId = createSession({
         access_token: json.access_token,
         refresh_token: json.refresh_token,
         expires_at: Date.now() + (json.expires_in || 3600) * 1000 - 5 * 60 * 1000,
         user_id: null,
-      };
+      });
       // Do not update global oauthTokens here.  Per‑user sessions should be
       // independent, and storing the token globally would cause all users
       // to share the same credentials.  The oauthTokens object is only
@@ -513,18 +772,41 @@ const server = http.createServer(async (req, res) => {
       // Set a cookie with the new session id.  HttpOnly prevents client side
       // JavaScript from reading the cookie.  The cookie lasts for the same
       // duration as the access token (approx) but could be adjusted.
-      const expires = new Date(sessions[newSessionId].expires_at).toUTCString();
       res.writeHead(302, {
         Location: '/',
-        'Set-Cookie': `session_id=${newSessionId}; Path=/; HttpOnly; Expires=${expires}`,
+        'Set-Cookie': [
+          `session_id=${signedSessionCookie(newSessionId)}; ${cookieAttributes(Math.floor(SESSION_ABSOLUTE_MS / 1000))}`,
+          `oauth_state=; ${cookieAttributes(0)}`,
+        ],
       });
+      console.info('Authentication succeeded');
       res.end();
       return;
     } catch (err) {
-      res.writeHead(500, { 'Content-Type': 'text/plain' });
-      res.end('Authentication failed: ' + err.message);
+      console.warn('Authentication failed');
+      res.writeHead(502, {
+        'Content-Type': 'text/plain',
+        'Set-Cookie': `oauth_state=; ${cookieAttributes(0)}`,
+      });
+      res.end('Authentication failed');
       return;
     }
+  }
+
+  if (pathname === '/logout' && req.method === 'POST') {
+    if (!isSameOriginRequest(req)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Cross-site request rejected' }));
+      return;
+    }
+    const destroyed = destroySession(req);
+    res.writeHead(204, {
+      'Set-Cookie': `session_id=; ${cookieAttributes(0)}`,
+      'Cache-Control': 'no-store',
+    });
+    if (destroyed) console.info('Session logged out');
+    res.end();
+    return;
   }
 
   // Auth status route.  Returns JSON with authentication state.
@@ -534,25 +816,22 @@ const server = http.createServer(async (req, res) => {
     // the access token is not expired.  If using a personal token or the
     // global oauthTokens is still valid, authenticate as well.  The
     // response indicates whether the current request is authenticated.
-    const session = getSession(req);
-    const authenticated = !!(
-      BEXIO_TOKEN ||
-      (session && session.access_token && Date.now() < session.expires_at) ||
-      (oauthTokens.access_token && Date.now() < oauthTokens.expires_at)
-    );
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    const authenticated = isAuthenticated(req);
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify({ authenticated }));
     return;
   }
 
-  // Enable CORS for API endpoints.
   if (pathname.startsWith('/api/')) {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204);
-      res.end();
+    if (!isAuthenticated(req)) {
+      console.warn('Unauthenticated API request rejected');
+      res.writeHead(401, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ error: 'Authentication required' }));
+      return;
+    }
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) && !isSameOriginRequest(req)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Cross-site request rejected' }));
       return;
     }
   }
@@ -562,6 +841,11 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/api/projects' && req.method === 'GET') {
       // Search projects; optional `q` parameter for search term.
       const q = parsedUrl.query.q || '';
+      if (typeof q !== 'string' || q.length > 100) {
+        const error = new Error('q must be at most 100 characters');
+        error.statusCode = 400;
+        throw error;
+      }
       const data = await bexioRequest('GET', '/pr_project', q ? { search_term: q } : {}, null, req);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(data));
@@ -583,7 +867,7 @@ const server = http.createServer(async (req, res) => {
       // not found or the user lacks permissions, propagate the error.
       const parts = pathname.split('/');
       const id = parts[3];
-      if (!id) {
+      if (!validId(id)) {
         res.writeHead(400);
         res.end('Missing project id');
         return;
@@ -602,7 +886,7 @@ const server = http.createServer(async (req, res) => {
       // request is forbidden (403), propagate the error to the client.
       const parts = pathname.split('/');
       const id = parts[3];
-      if (!id) {
+      if (!validId(id)) {
         res.writeHead(400);
         res.end('Missing contact id');
         return;
@@ -621,7 +905,7 @@ const server = http.createServer(async (req, res) => {
       // return an empty array instead of propagating the error.  Otherwise
       // propagate the error as usual.
       const projectId = parsedUrl.query.project_id;
-      if (!projectId) {
+      if (!validId(projectId)) {
         res.writeHead(400);
         res.end('Missing project_id');
         return;
@@ -649,7 +933,7 @@ const server = http.createServer(async (req, res) => {
           }
         }
         // Remove duplicate packages by id
-        const unique = {};
+        const unique = Object.create(null);
         data.forEach((pkg) => {
           unique[pkg.id] = pkg;
         });
@@ -695,7 +979,7 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify(data));
       return;
     } else if (pathname === '/api/timesheets' && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = validateTimesheetBody(await parseBody(req));
       // If user_id not provided, use default from environment.  Some Bexio
       // installations require user_id and allowable_bill fields to be set when
       // creating timesheets.  Provide reasonable defaults if missing.
@@ -737,7 +1021,12 @@ const server = http.createServer(async (req, res) => {
       return;
     } else if (pathname.startsWith('/api/timesheets/') && (req.method === 'PUT' || req.method === 'POST')) {
       const id = pathname.split('/')[3];
-      const body = await parseBody(req);
+      if (!validId(id)) {
+        const error = new Error('Invalid timesheet id');
+        error.statusCode = 400;
+        throw error;
+      }
+      const body = validateTimesheetBody(await parseBody(req));
       // Provide default user_id and allowable_bill if missing
       // Determine user id from request body or OAuth token or env
       if (!body.user_id) {
@@ -772,28 +1061,52 @@ const server = http.createServer(async (req, res) => {
       return;
     } else if (pathname.startsWith('/api/timesheets/') && req.method === 'DELETE') {
       const id = pathname.split('/')[3];
+      if (!validId(id)) {
+        const error = new Error('Invalid timesheet id');
+        error.statusCode = 400;
+        throw error;
+      }
       const data = await bexioRequest('DELETE', `/timesheet/${id}`, {}, null, req);
       res.writeHead(204);
       res.end();
       return;
     }
   } catch (error) {
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: error.message }));
+    const status = error.statusCode || (error.message === 'Not authenticated. Please login via /auth/login' ? 401 : 502);
+    if (status >= 500) console.error('Request failed');
+    res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify({ error: status >= 500 ? 'Upstream service request failed' : error.message }));
     return;
   }
 
   // Serve static files
+  if (!['GET', 'HEAD'].includes(req.method)) {
+    res.writeHead(405, { Allow: 'GET, HEAD' });
+    res.end('Method not allowed');
+    return;
+  }
   let filePath = pathname;
   if (filePath === '/' || filePath === '') {
     filePath = '/index.html';
   }
-  filePath = path.join(STATIC_ROOT, filePath);
+  try {
+    filePath = decodeURIComponent(filePath);
+  } catch (_) {
+    res.writeHead(400);
+    res.end('Invalid path');
+    return;
+  }
+  filePath = path.resolve(STATIC_ROOT, `.${filePath}`);
+  if (filePath !== STATIC_ROOT && !filePath.startsWith(`${STATIC_ROOT}${path.sep}`)) {
+    res.writeHead(404);
+    res.end('Not found');
+    return;
+  }
   serveStatic(filePath, res);
 });
 
-const PORT = process.env.PORT || 3000;
-const HOST = process.env.HOST || '127.0.0.1';
+const PORT = CONFIG.port;
+const HOST = CONFIG.host;
 
 if (require.main === module) {
   server.listen(PORT, HOST, () => {
@@ -801,4 +1114,15 @@ if (require.main === module) {
   });
 }
 
-module.exports = { fetchTimesheetsInRange, getTimesheetDate, isValidDateOnly };
+module.exports = {
+  CONFIG,
+  loadConfig,
+  server,
+  sessions,
+  createSession,
+  signedSessionCookie,
+  cookieAttributes,
+  fetchTimesheetsInRange,
+  getTimesheetDate,
+  isValidDateOnly,
+};

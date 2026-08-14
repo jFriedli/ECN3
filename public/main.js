@@ -28,7 +28,7 @@ let activities = [];
 let statuses = [];
 let packages = [];
 // Map of package id to name for quick lookup.  Populated when packages are loaded.
-const packageMap = {};
+const packageMap = Object.create(null);
 // Store the total hours booked per day for the current view.  Keys are ISO
 // dates (YYYY-MM-DD) and values are the number of hours booked on that day.
 let dailyTotals = {};
@@ -391,7 +391,7 @@ async function loadPackages(projectId) {
   try {
     const data = await fetchJson(`${API.packages}?project_id=${projectId}`);
     // Remove duplicates by id
-    const unique = {};
+    const unique = Object.create(null);
     data.forEach((pkg) => {
       unique[pkg.id] = pkg;
     });
@@ -973,15 +973,37 @@ function updateDayHeader() {
       const dateKey = `${y}-${m}-${d}`;
       const totalHours = dailyTotals[dateKey] || 0;
       const totalText = totalHours ? `${parseFloat(totalHours.toFixed(2))}h` : '';
-      cells.push(`<div class="day-header-cell"><div class="day-date">${dayLabel} ${dayNum}.${monthNum}</div><div class="day-total">${totalText}</div></div>`);
+      cells.push({ dateText: `${dayLabel} ${dayNum}.${monthNum}`, totalText });
     }
     iter.setDate(iter.getDate() + 1);
   }
-  headerEl.innerHTML = cells.join('');
+  headerEl.replaceChildren();
+  cells.forEach(({ dateText, totalText }) => {
+    const cell = document.createElement('div');
+    cell.className = 'day-header-cell';
+    const dateEl = document.createElement('div');
+    dateEl.className = 'day-date';
+    dateEl.textContent = dateText;
+    const totalEl = document.createElement('div');
+    totalEl.className = 'day-total';
+    totalEl.textContent = totalText;
+    cell.append(dateEl, totalEl);
+    headerEl.appendChild(cell);
+  });
 }
 
 // Set up event listeners for UI controls
 function bindUI() {
+  document.getElementById('logout-btn').addEventListener('click', async () => {
+    try {
+      const response = await fetch('/logout', { method: 'POST' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      window.location.reload();
+    } catch (err) {
+      console.error('Logout failed:', err);
+      alert('Logout failed. Please try again.');
+    }
+  });
   // Week navigation
   document.getElementById('prev-btn').addEventListener('click', () => {
     if (calendar) {
