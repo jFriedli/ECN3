@@ -1,7 +1,18 @@
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const test = require('node:test');
 
-const { loadConfig, cookieAttributes } = require('../server');
+const { loadConfig, cookieAttributes, DEFAULT_BEXIO_SCOPES } = require('../server');
+
+test('OAuth defaults and example use the documented project read scope', () => {
+  const legacyScope = ['pr', 'project', 'show'].join('_');
+  const example = fs.readFileSync(require.resolve('../.env.example'), 'utf8');
+  assert.match(DEFAULT_BEXIO_SCOPES, /(?:^| )project_show(?: |$)/);
+  assert.doesNotMatch(DEFAULT_BEXIO_SCOPES, new RegExp(legacyScope));
+  assert.match(example, /BEXIO_SCOPES=.*(?:^| )project_show(?: |$)/m);
+  assert.doesNotMatch(example, new RegExp(legacyScope));
+  assert.doesNotMatch(example, /(?:^| )project_edit(?: |$)/m);
+});
 
 test('HTTPS APP_BASE_URL produces Secure session cookies', () => {
   const config = loadConfig({ APP_BASE_URL: 'https://localhost:8443' });

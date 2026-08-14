@@ -303,6 +303,11 @@
       background: #3a3a3a;
     }
 
+    /* Event titles may contain a second, plain-text context line. */
+    .ec-event-title {
+      white-space: pre-line;
+    }
+
     /* Override EventCalendar CSS variables in dark mode to improve contrast. */
     body.ec-dark {
       --ec-bg-color: #1f1f1f;

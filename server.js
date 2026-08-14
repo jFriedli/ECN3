@@ -89,9 +89,10 @@ const BEXIO_CLIENT_ID = process.env.BEXIO_CLIENT_ID || '';
 const BEXIO_CLIENT_SECRET = process.env.BEXIO_CLIENT_SECRET || '';
 const BEXIO_REDIRECT_URI = CONFIG.oauthRedirectUri;
 
-// Scopes requested during OAuth login.  Can be overridden via env.
-const BEXIO_SCOPES = process.env.BEXIO_SCOPES ||
-  'openid offline_access pr_project_show timesheet_show timesheet_edit client_service_show timesheet_status_show';
+// Scopes requested during OAuth login. Can be overridden via env.
+const DEFAULT_BEXIO_SCOPES =
+  'openid offline_access project_show timesheet_show timesheet_edit client_service_show timesheet_status_show';
+const BEXIO_SCOPES = process.env.BEXIO_SCOPES || DEFAULT_BEXIO_SCOPES;
 
 // Optional: default user ID for timesheet creation.  Set BEXIO_USER_ID in
 // .env to automatically assign the current user when creating timesheets.
@@ -474,6 +475,70 @@ function serveStatic(filePath, res) {
   });
 }
 
+function sanitizeUpstreamErrorBody(body) {
+  if (typeof body !== 'string') return '';
+  return body
+    .slice(0, 2000)
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
+    .replace(/("?(?:access_token|refresh_token|client_secret|authorization|cookie)"?\s*[:=]\s*)"?[^",\s}]+"?/gi,
+      '$1[REDACTED]');
+}
+
+function sanitizeDiagnosticMessage(message) {
+  return sanitizeUpstreamErrorBody(typeof message === 'string' ? message : '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .slice(0, 500);
+}
+
+function logUpstreamFailure(method, apiVersion, endpoint, response, body) {
+  const sanitizedBody = sanitizeUpstreamErrorBody(body);
+  const detail = sanitizedBody ? `: ${sanitizedBody}` : '';
+  console.error(
+    `Bexio request failed: ${method} /${apiVersion}${endpoint} -> ` +
+    `${response.status} ${response.statusText}${detail}`,
+  );
+}
+
+const SUPPORTED_BEXIO_API_VERSIONS = new Set(['2.0', '3.0']);
+
+function buildBexioUrl(version, endpoint, queryParams = {}) {
+  if (!SUPPORTED_BEXIO_API_VERSIONS.has(version)) {
+    throw new TypeError('Unsupported Bexio API version');
+  }
+  if (typeof endpoint !== 'string' || !endpoint.startsWith('/') || endpoint.startsWith('//') ||
+      endpoint.includes('\\') || endpoint.includes('\0') || endpoint.includes('?') ||
+      endpoint.includes('#') || endpoint.includes('@')) {
+    throw new TypeError('Invalid Bexio API endpoint');
+  }
+
+  const segments = endpoint.slice(1).split('/');
+  if (segments.some((segment) => segment.length === 0)) {
+    throw new TypeError('Invalid Bexio API endpoint path');
+  }
+  for (const segment of segments) {
+    let decoded;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch (_) {
+      throw new TypeError('Invalid encoding in Bexio API endpoint');
+    }
+    if (decoded === '.' || decoded === '..' || decoded.includes('/') || decoded.includes('\\') ||
+        decoded.includes('\0')) {
+      throw new TypeError('Invalid Bexio API endpoint path segment');
+    }
+  }
+
+  const url = new URL(endpoint.slice(1), `https://api.bexio.com/${version}/`);
+  if (url.protocol !== 'https:' || url.hostname !== 'api.bexio.com' || url.port !== '' ||
+      url.username !== '' || url.password !== '' || !url.pathname.startsWith(`/${version}/`)) {
+    throw new TypeError('Invalid Bexio API destination');
+  }
+  for (const [name, value] of Object.entries(queryParams || {})) {
+    if (value !== undefined && value !== null) url.searchParams.append(name, String(value));
+  }
+  return url;
+}
+
 // Helper to perform API requests to Bexio.
 async function bexioRequest(method, endpoint, queryParams = {}, body = null, req = null) {
   // Determine which access token to use (personal, session or OAuth).  When
@@ -487,10 +552,7 @@ async function bexioRequest(method, endpoint, queryParams = {}, body = null, req
     // If session retrieval fails, fall back to global token
     token = await getAccessToken();
   }
-  const baseUrl = 'https://api.bexio.com/2.0';
-  // Build query string.
-  const queryString = new URLSearchParams(queryParams).toString();
-  const url = `${baseUrl}${endpoint}${queryString ? '?' + queryString : ''}`;
+  const url = buildBexioUrl('2.0', endpoint, queryParams);
   const options = {
     method,
     headers: {
@@ -502,11 +564,19 @@ async function bexioRequest(method, endpoint, queryParams = {}, body = null, req
     options.headers['Content-Type'] = 'application/json';
     options.body = JSON.stringify(body);
   }
-  const response = await fetch(url, options);
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch (error) {
+    const reason = sanitizeUpstreamErrorBody(error?.message || 'network error');
+    console.error(`Bexio request failed: ${method} /2.0${endpoint} -> network error: ${reason}`);
+    throw new Error('Bexio API network request failed');
+  }
   if (!response.ok) {
     const text = await response.text();
+    logUpstreamFailure(method, '2.0', endpoint, response, text);
     throw new Error(
-      `Bexio API error: ${response.status} ${response.statusText} – ${text}`,
+      `Bexio API error: ${response.status} ${response.statusText}`,
     );
   }
   return response.json();
@@ -526,9 +596,7 @@ async function bexioRequestV3(method, endpoint, queryParams = {}, body = null, r
   } catch (err) {
     token = await getAccessToken();
   }
-  const baseUrl = 'https://api.bexio.com/3.0';
-  const queryString = new URLSearchParams(queryParams).toString();
-  const url = `${baseUrl}${endpoint}${queryString ? '?' + queryString : ''}`;
+  const url = buildBexioUrl('3.0', endpoint, queryParams);
   const options = {
     method,
     headers: {
@@ -540,11 +608,19 @@ async function bexioRequestV3(method, endpoint, queryParams = {}, body = null, r
     options.headers['Content-Type'] = 'application/json';
     options.body = JSON.stringify(body);
   }
-  const response = await fetch(url, options);
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch (error) {
+    const reason = sanitizeUpstreamErrorBody(error?.message || 'network error');
+    console.error(`Bexio request failed: ${method} /3.0${endpoint} -> network error: ${reason}`);
+    throw new Error('Bexio API v3 network request failed');
+  }
   if (!response.ok) {
     const text = await response.text();
+    logUpstreamFailure(method, '3.0', endpoint, response, text);
     throw new Error(
-      `Bexio API v3 error: ${response.status} ${response.statusText} – ${text}`,
+      `Bexio API v3 error: ${response.status} ${response.statusText}`,
     );
   }
   return response.json();
@@ -649,6 +725,45 @@ function isValidDateOnly(value) {
   return date.getUTCFullYear() === year &&
     date.getUTCMonth() === month - 1 &&
     date.getUTCDate() === day;
+}
+
+function findSelectableProjectStateIds(states) {
+  if (!Array.isArray(states)) return [];
+
+  const selectableNames = new Set([
+    'active',
+    'aktiv',
+    'open',
+    'offen',
+  ]);
+
+  return states
+    .filter((state) => {
+      if (typeof state?.name !== 'string') return false;
+
+      const normalizedName = state.name
+        .normalize('NFKC')
+        .trim()
+        .toLowerCase();
+
+      return selectableNames.has(normalizedName);
+    })
+    .map((state) => state.id)
+    .filter((id) => id !== null && id !== undefined);
+}
+
+function filterActiveProjects(projects, states) {
+  if (!Array.isArray(projects)) return [];
+
+  const selectableStateIds = new Set(
+    findSelectableProjectStateIds(states)
+  );
+
+  if (selectableStateIds.size === 0) return [];
+
+  return projects.filter((project) =>
+    selectableStateIds.has(project?.pr_state_id)
+  );
 }
 
 // Bexio orders timesheets by their top-level date. Tracking data is retained
@@ -881,14 +996,44 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
   try {
     // API routes
     if (pathname === '/api/projects' && req.method === 'GET') {
-      // Search projects; optional `q` parameter for search term.
+      // Search projects; active_only is used by the project picker. The
+      // unfiltered endpoint remains available for resolving historical entries.
       const q = parsedUrl.query.q || '';
       if (typeof q !== 'string' || q.length > 100) {
         const error = new Error('q must be at most 100 characters');
         error.statusCode = 400;
         throw error;
       }
-      const data = await bexioRequest('GET', '/pr_project', q ? { search_term: q } : {}, null, req);
+      const activeOnly = parsedUrl.query.active_only || 'false';
+      if (!['true', 'false'].includes(activeOnly)) {
+        const error = new Error('active_only must be true or false');
+        error.statusCode = 400;
+        throw error;
+      }
+      let data;
+      if (activeOnly === 'true') {
+        // Fetch both documented resources independently. This avoids making
+        // active selection depend on the more fragile POST search endpoint.
+        const [projectsResult, statesResult] = await Promise.allSettled([
+          bexioRequest('GET', '/pr_project', {}, null, req),
+          bexioRequest('GET', '/pr_project_state', {}, null, req),
+        ]);
+        if (projectsResult.status === 'rejected') throw projectsResult.reason;
+        if (statesResult.status === 'rejected') throw statesResult.reason;
+        const states = statesResult.value;
+        const selectableStateIds = findSelectableProjectStateIds(states);
+        if (selectableStateIds.length === 0) {
+          throw new Error('Bexio did not return any selectable project statuses');
+        }
+        data = filterActiveProjects(projectsResult.value, states);
+        if (q) {
+          const normalizedQuery = q.toLowerCase();
+          data = data.filter((project) =>
+            typeof project?.name === 'string' && project.name.toLowerCase().includes(normalizedQuery));
+        }
+      } else {
+        data = await bexioRequest('GET', '/pr_project', q ? { search_term: q } : {}, null, req);
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(data));
       return;
@@ -914,8 +1059,9 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
         res.end('Missing project id');
         return;
       }
+      const safeId = encodeURIComponent(String(id));
       try {
-        const data = await bexioRequest('GET', `/pr_project/${id}`, {}, null, req);
+        const data = await bexioRequest('GET', `/pr_project/${safeId}`, {}, null, req);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(data));
       } catch (err) {
@@ -933,8 +1079,9 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
         res.end('Missing contact id');
         return;
       }
+      const safeId = encodeURIComponent(String(id));
       try {
-        const data = await bexioRequest('GET', `/contact/${id}`, {}, null, req);
+        const data = await bexioRequest('GET', `/contact/${safeId}`, {}, null, req);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(data));
       } catch (err) {
@@ -952,6 +1099,7 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
         res.end('Missing project_id');
         return;
       }
+      const safeProjectId = encodeURIComponent(String(projectId));
       try {
         // Try the v3.0 project packages endpoint first.  This returns
         // packages for the given project.  If it fails (e.g. not found),
@@ -959,7 +1107,7 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
         // duplicates are removed.  Log the packages for debugging.
         let data = [];
         try {
-          data = await bexioRequestV3('GET', `/projects/${projectId}/packages`, {}, null, req);
+          data = await bexioRequestV3('GET', `/projects/${safeProjectId}/packages`, {}, null, req);
         } catch (errV3) {
           // Fall back to v2.0 if v3.0 endpoint fails (e.g. 404 or not available)
           try {
@@ -1068,6 +1216,7 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
         error.statusCode = 400;
         throw error;
       }
+      const safeId = encodeURIComponent(String(id));
       const body = validateTimesheetBody(await parseBody(req));
       // Provide default user_id and allowable_bill if missing
       // Determine user id from request body or OAuth token or env
@@ -1094,7 +1243,7 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
       try {
         // Use POST to update an existing timesheet.  Bexio's API expects
         // timesheet updates via a POST request to /timesheet/{id}, not PUT.
-        const data = await bexioRequest('POST', `/timesheet/${id}`, {}, body, req);
+        const data = await bexioRequest('POST', `/timesheet/${safeId}`, {}, body, req);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(data));
       } catch (err) {
@@ -1108,14 +1257,17 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
         error.statusCode = 400;
         throw error;
       }
-      const data = await bexioRequest('DELETE', `/timesheet/${id}`, {}, null, req);
+      const safeId = encodeURIComponent(String(id));
+      const data = await bexioRequest('DELETE', `/timesheet/${safeId}`, {}, null, req);
       res.writeHead(204);
       res.end();
       return;
     }
   } catch (error) {
     const status = error.statusCode || (error.message === 'Not authenticated. Please login via /auth/login' ? 401 : 502);
-    if (status >= 500) console.error('Request failed');
+    if (status >= 500) {
+      console.error(`Request failed: ${sanitizeDiagnosticMessage(error?.message || 'Unknown error')}`);
+    }
     res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify({ error: status >= 500 ? 'Upstream service request failed' : error.message }));
     return;
@@ -1150,6 +1302,10 @@ if (require.main === module) {
 
 module.exports = {
   resolveStaticPath,
+  buildBexioUrl,
+  validId,
+  sanitizeUpstreamErrorBody,
+  DEFAULT_BEXIO_SCOPES,
   CONFIG,
   loadConfig,
   server,
@@ -1158,6 +1314,8 @@ module.exports = {
   signedSessionCookie,
   cookieAttributes,
   fetchTimesheetsInRange,
+  findSelectableProjectStateIds,
+  filterActiveProjects,
   getTimesheetDate,
   isValidDateOnly,
 };

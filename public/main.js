@@ -13,6 +13,7 @@
 // API endpoints served by the Node backend
 const API = {
   projects: '/api/projects',
+  activeProjects: '/api/projects?active_only=true',
   activities: '/api/activities',
   statuses: '/api/statuses',
   packages: '/api/packages',
@@ -24,6 +25,7 @@ const API = {
 // Global data caches
 let calendar = null;
 let projects = [];
+let selectableProjects = [];
 let activities = [];
 let statuses = [];
 let packages = [];
@@ -42,6 +44,80 @@ let defaultUserId = null;
 // details).  This prevents duplicate API requests when opening the
 // modal pre-fills the project value.
 let suppressProjectEvents = false;
+
+const HTML_ENTITIES = Object.freeze({
+  Auml: 'Ä',
+  Ouml: 'Ö',
+  Uuml: 'Ü',
+  amp: '&',
+  apos: "'",
+  auml: 'ä',
+  copy: '©',
+  euro: '€',
+  gt: '>',
+  hellip: '…',
+  lt: '<',
+  mdash: '—',
+  nbsp: ' ',
+  ndash: '–',
+  ouml: 'ö',
+  pound: '£',
+  quot: '"',
+  reg: '®',
+  szlig: 'ß',
+  uuml: 'ü',
+  yen: '¥',
+});
+
+// Convert Bexio's HTML-flavoured strings to plain text. The returned value
+// must always be rendered through textContent/value, never as HTML.
+function normalizeBexioText(value, { singleLine = false } = {}) {
+  if (value === null || value === undefined) return '';
+  let text = String(value).replace(/<\/?br\s*\/?>/gi, '\n');
+  text = text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (entity, code) => {
+    if (Object.hasOwn(HTML_ENTITIES, code)) return HTML_ENTITIES[code];
+    const lowerCode = code.toLowerCase();
+    if (Object.hasOwn(HTML_ENTITIES, lowerCode)) return HTML_ENTITIES[lowerCode];
+    let codePoint = null;
+    if (lowerCode.startsWith('#x')) codePoint = Number.parseInt(lowerCode.slice(2), 16);
+    else if (lowerCode.startsWith('#')) codePoint = Number.parseInt(lowerCode.slice(1), 10);
+    if (codePoint === null || !Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff ||
+        (codePoint >= 0xd800 && codePoint <= 0xdfff)) return entity;
+    return String.fromCodePoint(codePoint);
+  });
+  return singleLine ? text.replace(/\s*\n\s*/g, ' ').replace(/[\t ]+/g, ' ').trim() : text;
+}
+
+const PROJECT_COLORS = Object.freeze([
+  { backgroundColor: '#365f7d', borderColor: '#6093b8', textColor: '#ffffff' },
+  { backgroundColor: '#3f6b5b', borderColor: '#70a58f', textColor: '#ffffff' },
+  { backgroundColor: '#65527d', borderColor: '#9882b2', textColor: '#ffffff' },
+  { backgroundColor: '#326c72', borderColor: '#63a0a5', textColor: '#ffffff' },
+  { backgroundColor: '#744f63', borderColor: '#a77d92', textColor: '#ffffff' },
+  { backgroundColor: '#705d3f', borderColor: '#a28b62', textColor: '#ffffff' },
+]);
+
+const NON_PROJECT_COLORS = Object.freeze([
+  { backgroundColor: '#5d5f67', borderColor: '#8e919b', textColor: '#ffffff' },
+  { backgroundColor: '#625840', borderColor: '#968764', textColor: '#ffffff' },
+  { backgroundColor: '#4f6254', borderColor: '#7f9584', textColor: '#ffffff' },
+]);
+
+function stableTextHash(value) {
+  let hash = 2166136261;
+  for (const character of String(value)) {
+    hash ^= character.codePointAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function getEventColor(projectId, classification = 'internal') {
+  const hasProject = projectId !== null && projectId !== undefined && String(projectId) !== '';
+  const palette = hasProject || classification === 'project' ? PROJECT_COLORS : NON_PROJECT_COLORS;
+  const key = hasProject ? `project:${projectId}` : `non-project:${classification}`;
+  return palette[stableTextHash(key) % palette.length];
+}
 
 // Opens the multi‑day planner modal.  Sets default start and end dates to today
 // and selects no activity by default.  Activities will be populated when
@@ -190,7 +266,7 @@ async function fetchContactName(contactId) {
     let name = '';
     if (data.name_1) name = data.name_1;
     if (data.name_2) name = name ? `${name} ${data.name_2}` : data.name_2;
-    return name;
+    return normalizeBexioText(name, { singleLine: true });
   } catch (err) {
     console.error('Failed to fetch contact name:', err);
     return '';
@@ -230,7 +306,10 @@ function populateSelect(selectEl, data, labelField) {
   data.forEach((item) => {
     const option = document.createElement('option');
     option.value = item.id;
-    option.textContent = item[labelField] || item.name || item.title || item.text;
+    option.textContent = normalizeBexioText(
+      item[labelField] || item.name || item.title || item.text,
+      { singleLine: true },
+    );
     selectEl.appendChild(option);
   });
 }
@@ -243,7 +322,7 @@ function populateProjectDatalist(datalistEl, data) {
   }
   data.forEach((item) => {
     const option = document.createElement('option');
-    option.value = item.name || item.title || item.text;
+    option.value = normalizeBexioText(item.name || item.title || item.text, { singleLine: true });
     option.setAttribute('data-id', item.id);
     datalistEl.appendChild(option);
   });
@@ -268,14 +347,15 @@ function initProjectSearch() {
   input.setAttribute('spellcheck', 'false');
   input.addEventListener('input', async () => {
     if (suppressProjectEvents) return;
-    const query = input.value.toLowerCase();
-    suggestionsEl.innerHTML = '';
+    const query = normalizeBexioText(input.value, { singleLine: true }).toLowerCase();
+    suggestionsEl.replaceChildren();
     if (!query) {
       suggestionsEl.style.display = 'none';
       return;
     }
     // Filter projects by name containing the query
-    const matches = projects.filter((p) => (p.name || '').toLowerCase().includes(query)).slice(0, 10);
+    const matches = selectableProjects.filter((project) =>
+      normalizeBexioText(project.name, { singleLine: true }).toLowerCase().includes(query)).slice(0, 10);
     if (matches.length === 0) {
       suggestionsEl.style.display = 'none';
       return;
@@ -283,12 +363,12 @@ function initProjectSearch() {
     matches.forEach((proj) => {
       const item = document.createElement('div');
       item.className = 'suggestion-item';
-      item.textContent = proj.name || '';
+      item.textContent = normalizeBexioText(proj.name, { singleLine: true });
       item.dataset.id = proj.id;
       item.addEventListener('click', async () => {
         // When a suggestion is clicked, populate the input and hidden ID
         suppressProjectEvents = true;
-        input.value = proj.name || '';
+        input.value = normalizeBexioText(proj.name, { singleLine: true });
         document.getElementById('project-id').value = proj.id;
         suggestionsEl.style.display = 'none';
         // Clear existing contact fields
@@ -342,34 +422,58 @@ function initProjectSearch() {
   });
 }
 
+function settledArray(result) {
+  return result?.status === 'fulfilled' && Array.isArray(result.value) ? result.value : [];
+}
+
+function resolveReferenceResults(results) {
+  return {
+    activities: settledArray(results[0]),
+    statuses: settledArray(results[1]),
+    projects: settledArray(results[2]),
+    selectableProjects: settledArray(results[3]),
+  };
+}
+
 // Load and cache the reference data: projects, activities, statuses.
 async function loadReferenceData() {
-  try {
-    const [acts, stats, projs] = await Promise.all([
+  const [activitiesResult, statusesResult, projectsResult, activeProjectsResult] =
+    await Promise.allSettled([
       fetchJson(API.activities),
       fetchJson(API.statuses),
       fetchJson(API.projects),
+      fetchJson(API.activeProjects),
     ]);
-    activities = acts;
-    statuses = stats;
-    projects = projs;
-    populateSelect(document.getElementById('activity-select'), activities, 'name');
-    populateSelect(document.getElementById('status-select'), statuses, 'name');
-    // Populate the activity select in the multi‑day planner modal if present
-    const multiActSelect = document.getElementById('multi-activity-select');
-    if (multiActSelect) {
-      populateSelect(multiActSelect, activities, 'name');
-    }
-    // Populate datalist for backward compatibility if present
-    const dl = document.getElementById('project-list');
-    if (dl) {
-      populateProjectDatalist(dl, projects);
-    }
-    // Initialise custom search suggestions for projects
-    initProjectSearch();
-  } catch (err) {
-    console.error('Failed to load reference data:', err);
+
+  const resolved = resolveReferenceResults([
+    activitiesResult, statusesResult, projectsResult, activeProjectsResult,
+  ]);
+  activities = resolved.activities;
+  statuses = resolved.statuses;
+  projects = resolved.projects;
+  selectableProjects = resolved.selectableProjects;
+
+  if (activitiesResult.status === 'rejected') console.warn('Activity fallback lookup unavailable');
+  if (statusesResult.status === 'rejected') console.warn('Timesheet status lookup unavailable');
+  if (projectsResult.status === 'rejected') console.warn('Historical project fallback lookup unavailable');
+  if (activeProjectsResult.status === 'rejected') {
+    console.warn('Active project suggestions unavailable');
   }
+
+  populateSelect(document.getElementById('activity-select'), activities, 'name');
+  populateSelect(document.getElementById('status-select'), statuses, 'name');
+  // Populate the activity select in the multi‑day planner modal if present
+  const multiActSelect = document.getElementById('multi-activity-select');
+  if (multiActSelect) {
+    populateSelect(multiActSelect, activities, 'name');
+  }
+  // Populate datalist for backward compatibility if present
+  const dl = document.getElementById('project-list');
+  if (dl) {
+    populateProjectDatalist(dl, selectableProjects);
+  }
+  // Project search remains available but empty if active lookup failed.
+  initProjectSearch();
 }
 
 // Load packages for a given project ID and populate the package select.
@@ -398,12 +502,12 @@ async function loadPackages(projectId) {
     packages = Object.values(unique);
     // Update global packageMap with this project's packages
     packages.forEach((pkg) => {
-      packageMap[pkg.id] = pkg.name || pkg.title;
+      packageMap[pkg.id] = normalizeBexioText(pkg.name || pkg.title, { singleLine: true });
     });
     packages.forEach((pkg) => {
       const option = document.createElement('option');
       option.value = pkg.id;
-      option.textContent = pkg.name || pkg.title;
+      option.textContent = normalizeBexioText(pkg.name || pkg.title, { singleLine: true });
       pkgSelect.appendChild(option);
     });
   } catch (err) {
@@ -457,8 +561,55 @@ function parseDurationHours(duration) {
   return Number.isFinite(hours) ? hours : null;
 }
 
+function findById(items, id) {
+  return items.find((item) => String(item?.id) === String(id));
+}
+
+function buildEventPresentation(ts, referenceData = {}) {
+  const projectList = referenceData.projects || projects;
+  const activityList = referenceData.activities || activities;
+  const packagesById = referenceData.packageMap || packageMap;
+  const project = findById(projectList, ts?.pr_project_id);
+  const activity = findById(activityList, ts?.client_service_id);
+  const directProjectName = normalizeBexioText(ts?.project_name, { singleLine: true });
+  const fallbackProjectName = normalizeBexioText(project?.name || project?.title, { singleLine: true });
+  const projectName = directProjectName || fallbackProjectName;
+  const directActivityName = normalizeBexioText(ts?.activity_name, { singleLine: true });
+  const fallbackActivityName = normalizeBexioText(activity?.name || activity?.title, { singleLine: true });
+  const activityName = directActivityName || fallbackActivityName;
+  const remark = normalizeBexioText(ts?.text);
+  const packageName = normalizeBexioText(packagesById[ts?.pr_package_id], { singleLine: true });
+  const isProjectActivity = activityName.toLocaleLowerCase('de-CH') === 'projekt durchführung';
+  const hasProjectId = ts?.pr_project_id !== null && ts?.pr_project_id !== undefined &&
+    String(ts.pr_project_id) !== '';
+
+  let primary;
+  let classification;
+  if (hasProjectId || projectName) {
+    primary = projectName || 'Projekt';
+    if (packageName) primary = `${primary} – ${packageName}`;
+    classification = 'project';
+  } else if (isProjectActivity) {
+    primary = 'Projektarbeit';
+    classification = 'project';
+  } else if (activityName.toLocaleLowerCase('de-CH') === 'intern') {
+    primary = 'Intern';
+    classification = 'internal';
+  } else {
+    primary = `Intern · ${activityName || 'Ohne Aktivität'}`;
+    classification = 'internal';
+  }
+
+  const detail = remark || (projectName && !isProjectActivity ? activityName : '');
+  return {
+    title: detail && detail !== primary ? `${primary}\n${detail}` : primary,
+    classification,
+    remark,
+  };
+}
+
 // Transform a Bexio timesheet into an EventCalendar event object.
-function timesheetToEvent(ts) {
+function timesheetToEvent(ts, referenceData) {
   let start = ts?.tracking?.start || ts?.tracking?.date;
   // Guard against missing or invalid start dates
   if (!start) {
@@ -490,32 +641,22 @@ function timesheetToEvent(ts) {
       end = null;
     }
   }
-  const project = projects.find((p) => p.id === ts.pr_project_id);
-  let title = '';
-  if (project) {
-    title = project.name || '';
-  }
-  // Append work package name if available
-  const pkgId = ts.pr_package_id;
-  if (pkgId && packageMap[pkgId]) {
-    title = title ? `${title} – ${packageMap[pkgId]}` : packageMap[pkgId];
-  }
-  // Fallback to text if no project title
-  if (!title) {
-    title = ts.text || 'Time entry';
-  }
+  const presentation = buildEventPresentation(ts, referenceData);
+  const color = getEventColor(ts.pr_project_id, presentation.classification);
   return {
     id: ts.id,
-    title,
+    title: presentation.title,
     start: start,
     end: end,
     editable: true,
+    ...color,
     extendedProps: {
       project_id: ts.pr_project_id || '',
       client_service_id: ts.client_service_id || '',
       pr_package_id: ts.pr_package_id || '',
       status_id: ts.status_id || '',
-      remark: ts.text || '',
+      remark: presentation.remark,
+      classification: presentation.classification,
     },
   };
 }
@@ -644,8 +785,9 @@ async function openModal(data) {
   // Set project input and hidden ID.  Suppress events so that programmatic
   // changes do not trigger package loading and contact fetch twice.
   suppressProjectEvents = true;
-  const project = projects.find((p) => p.id === data.project_id);
-  document.getElementById('project-input').value = project ? (project.name || project.title || '') : '';
+  const project = findById(projects, data.project_id);
+  document.getElementById('project-input').value = project ?
+    normalizeBexioText(project.name || project.title, { singleLine: true }) : '';
   document.getElementById('project-id').value = data.project_id || '';
   // Load packages for selected project and wait for completion.  This ensures
   // the package select options are available before setting its value.
@@ -929,15 +1071,6 @@ function initCalendar() {
         info.revert();
       }
     },
-    // Apply a subtle border to events to improve separation when many overlap
-    eventDidMount: (info) => {
-      try {
-        info.el.style.border = '1px solid #555';
-        info.el.style.borderRadius = '3px';
-      } catch (_) {
-        // ignore styling errors
-      }
-    },
     // When the visible date range changes (e.g. navigating weeks), update the day header
     datesSet: () => {
       updateDayHeader();
@@ -1052,7 +1185,8 @@ function bindUI() {
     const val = e.target.value.trim();
     // Lookup the project by exact name (case‑insensitive) instead of relying on a datalist
     let matchedId = '';
-    const proj = projects.find((p) => (p.name || '').toLowerCase() === val.toLowerCase());
+    const proj = selectableProjects.find((project) =>
+      normalizeBexioText(project.name, { singleLine: true }).toLowerCase() === val.toLowerCase());
     if (proj) {
       matchedId = proj.id;
     }
@@ -1105,7 +1239,8 @@ function bindUI() {
     const val = e.target.value.trim();
     // Lookup the project by exact name (case‑insensitive) instead of using a datalist
     let matchedId = '';
-    const proj = projects.find((p) => (p.name || '').toLowerCase() === val.toLowerCase());
+    const proj = selectableProjects.find((project) =>
+      normalizeBexioText(project.name, { singleLine: true }).toLowerCase() === val.toLowerCase());
     if (proj) {
       matchedId = proj.id;
     }
