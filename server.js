@@ -651,6 +651,20 @@ function isValidDateOnly(value) {
     date.getUTCDate() === day;
 }
 
+function findActiveProjectStateId(states) {
+  if (!Array.isArray(states)) return null;
+  const activeState = states.find((state) =>
+    typeof state?.name === 'string' && state.name.trim().toLowerCase() === 'active');
+  return activeState?.id ?? null;
+}
+
+function filterActiveProjects(projects, states) {
+  if (!Array.isArray(projects)) return [];
+  const activeStateId = findActiveProjectStateId(states);
+  if (activeStateId === null) return [];
+  return projects.filter((project) => String(project?.pr_state_id) === String(activeStateId));
+}
+
 // Bexio orders timesheets by their top-level date. Tracking data is retained
 // as a fallback for older/mixed records, but records without a usable date are
 // ignored rather than allowed to break range filtering or pagination.
@@ -881,14 +895,34 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
   try {
     // API routes
     if (pathname === '/api/projects' && req.method === 'GET') {
-      // Search projects; optional `q` parameter for search term.
+      // Search projects; active_only is used by the project picker. The
+      // unfiltered endpoint remains available for resolving historical entries.
       const q = parsedUrl.query.q || '';
       if (typeof q !== 'string' || q.length > 100) {
         const error = new Error('q must be at most 100 characters');
         error.statusCode = 400;
         throw error;
       }
-      const data = await bexioRequest('GET', '/pr_project', q ? { search_term: q } : {}, null, req);
+      const activeOnly = parsedUrl.query.active_only || 'false';
+      if (!['true', 'false'].includes(activeOnly)) {
+        const error = new Error('active_only must be true or false');
+        error.statusCode = 400;
+        throw error;
+      }
+      let data;
+      if (activeOnly === 'true') {
+        const states = await bexioRequest('GET', '/pr_project_state', {}, null, req);
+        const activeStateId = findActiveProjectStateId(states);
+        if (activeStateId === null) {
+          throw new Error('Bexio did not return an Active project status');
+        }
+        const criteria = [{ field: 'pr_state_id', value: activeStateId, criteria: '=' }];
+        if (q) criteria.push({ field: 'name', value: q, criteria: 'like' });
+        const matches = await bexioRequest('POST', '/pr_project/search', {}, criteria, req);
+        data = filterActiveProjects(matches, states);
+      } else {
+        data = await bexioRequest('GET', '/pr_project', q ? { search_term: q } : {}, null, req);
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(data));
       return;
@@ -1158,6 +1192,8 @@ module.exports = {
   signedSessionCookie,
   cookieAttributes,
   fetchTimesheetsInRange,
+  findActiveProjectStateId,
+  filterActiveProjects,
   getTimesheetDate,
   isValidDateOnly,
 };
