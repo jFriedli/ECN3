@@ -78,7 +78,7 @@ function loadFrontendFunctions() {
   vm.createContext(context);
   vm.runInContext(
     `${source}\nthis.frontend = { formatLocalDate, parseDurationHours, timesheetToEvent, ` +
-    `normalizeBexioText, getEventColor, buildEventPresentation };`,
+    `normalizeBexioText, getEventColor, buildEventPresentation, resolveReferenceResults };`,
     context,
   );
   return context.frontend;
@@ -138,7 +138,78 @@ test('event labels distinguish project work from internal work', () => {
   const projectActivity = buildEventPresentation(
     { client_service_id: 20, text: '' }, references);
   assert.equal(projectActivity.classification, 'project');
-  assert.equal(projectActivity.title, 'Projektarbeit · Projekt Durchführung');
+  assert.equal(projectActivity.title, 'Projektarbeit');
+});
+
+test('direct Bexio project fields classify and label an event without reference maps', () => {
+  const { buildEventPresentation } = loadFrontendFunctions();
+  const presentation = buildEventPresentation({
+    pr_project_id: 368,
+    project_name: 'Vertec Authentifizierung',
+    activity_name: 'Projekt Durchführung',
+    client_service_id: 4,
+    text: '',
+  }, { projects: [], activities: [], packageMap: {} });
+  assert.equal(presentation.classification, 'project');
+  assert.equal(presentation.title, 'Vertec Authentifizierung');
+});
+
+test('direct Bexio internal fields retain and normalize the user description', () => {
+  const { buildEventPresentation } = loadFrontendFunctions();
+  const first = buildEventPresentation({
+    pr_project_id: null,
+    project_name: null,
+    activity_name: 'Intern',
+    client_service_id: 8,
+    text: 'Knowledge Transfer Voirbereitung',
+  }, { projects: [], activities: [], packageMap: {} });
+  assert.equal(first.classification, 'internal');
+  assert.equal(first.title, 'Intern\nKnowledge Transfer Voirbereitung');
+
+  const normalized = buildEventPresentation({
+    activity_name: 'Intern',
+    client_service_id: 8,
+    text: 'Knowledge Transfer,&nbsp;Task Force Cyber Security Funnel',
+  }, { projects: [], activities: [{ id: 8, name: 'Wrong fallback' }], packageMap: {} });
+  assert.equal(normalized.title, 'Intern\nKnowledge Transfer, Task Force Cyber Security Funnel');
+});
+
+test('timesheet project ID determines color without an active-project cache', () => {
+  const { timesheetToEvent, getEventColor } = loadFrontendFunctions();
+  const event = timesheetToEvent({
+    id: 14336,
+    pr_project_id: 368,
+    project_name: 'Vertec Authentifizierung',
+    activity_name: 'Projekt Durchführung',
+    tracking: { date: '2026-08-09T08:00:00Z', duration: '01:00' },
+  }, { projects: [], activities: [], packageMap: {} });
+  assert.equal(event.backgroundColor, getEventColor(368).backgroundColor);
+  assert.equal(event.borderColor, getEventColor(368).borderColor);
+  assert.equal(event.extendedProps.classification, 'project');
+});
+
+test('active-project failure is isolated from reference fallbacks and event conversion', async () => {
+  const { resolveReferenceResults, timesheetToEvent } = loadFrontendFunctions();
+  const results = await Promise.allSettled([
+    Promise.resolve([{ id: 8, name: 'Intern' }]),
+    Promise.resolve([{ id: 1, name: 'Erledigt' }]),
+    Promise.resolve([{ id: 368, name: 'Historical fallback' }]),
+    Promise.reject(new Error('active projects unavailable')),
+  ]);
+  const resolved = resolveReferenceResults(results);
+  assert.equal(resolved.activities.length, 1);
+  assert.equal(resolved.projects.length, 1);
+  assert.equal(resolved.selectableProjects.length, 0);
+
+  const event = timesheetToEvent({
+    id: 14336,
+    pr_project_id: 368,
+    project_name: 'Vertec Authentifizierung',
+    activity_name: 'Projekt Durchführung',
+    tracking: { date: '2026-08-09T08:00:00Z', duration: '01:00' },
+  }, { projects: resolved.projects, activities: resolved.activities, packageMap: {} });
+  assert.equal(event.title, 'Vertec Authentifizierung');
+  assert.equal(event.extendedProps.classification, 'project');
 });
 
 test('active project search excludes inactive projects by Bexio pr_state_id', () => {

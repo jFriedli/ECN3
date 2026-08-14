@@ -474,6 +474,23 @@ function serveStatic(filePath, res) {
   });
 }
 
+function sanitizeUpstreamErrorBody(body) {
+  if (typeof body !== 'string') return '';
+  return body
+    .slice(0, 2000)
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
+    .replace(/("?(?:access_token|refresh_token|client_secret|authorization|cookie)"?\s*[:=]\s*)"?[^",\s}]+"?/gi,
+      '$1[REDACTED]');
+}
+
+function logUpstreamFailure(apiVersion, endpoint, response, body) {
+  console.error('Bexio upstream request failed', {
+    endpoint: `/${apiVersion}${endpoint}`,
+    status: response.status,
+    body: sanitizeUpstreamErrorBody(body),
+  });
+}
+
 // Helper to perform API requests to Bexio.
 async function bexioRequest(method, endpoint, queryParams = {}, body = null, req = null) {
   // Determine which access token to use (personal, session or OAuth).  When
@@ -505,8 +522,9 @@ async function bexioRequest(method, endpoint, queryParams = {}, body = null, req
   const response = await fetch(url, options);
   if (!response.ok) {
     const text = await response.text();
+    logUpstreamFailure('2.0', endpoint, response, text);
     throw new Error(
-      `Bexio API error: ${response.status} ${response.statusText} – ${text}`,
+      `Bexio API error: ${response.status} ${response.statusText}`,
     );
   }
   return response.json();
@@ -543,8 +561,9 @@ async function bexioRequestV3(method, endpoint, queryParams = {}, body = null, r
   const response = await fetch(url, options);
   if (!response.ok) {
     const text = await response.text();
+    logUpstreamFailure('3.0', endpoint, response, text);
     throw new Error(
-      `Bexio API v3 error: ${response.status} ${response.statusText} – ${text}`,
+      `Bexio API v3 error: ${response.status} ${response.statusText}`,
     );
   }
   return response.json();
@@ -911,15 +930,25 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
       }
       let data;
       if (activeOnly === 'true') {
-        const states = await bexioRequest('GET', '/pr_project_state', {}, null, req);
+        // Fetch both documented resources independently. This avoids making
+        // active selection depend on the more fragile POST search endpoint.
+        const [projectsResult, statesResult] = await Promise.allSettled([
+          bexioRequest('GET', '/pr_project', {}, null, req),
+          bexioRequest('GET', '/pr_project_state', {}, null, req),
+        ]);
+        if (projectsResult.status === 'rejected') throw projectsResult.reason;
+        if (statesResult.status === 'rejected') throw statesResult.reason;
+        const states = statesResult.value;
         const activeStateId = findActiveProjectStateId(states);
         if (activeStateId === null) {
           throw new Error('Bexio did not return an Active project status');
         }
-        const criteria = [{ field: 'pr_state_id', value: activeStateId, criteria: '=' }];
-        if (q) criteria.push({ field: 'name', value: q, criteria: 'like' });
-        const matches = await bexioRequest('POST', '/pr_project/search', {}, criteria, req);
-        data = filterActiveProjects(matches, states);
+        data = filterActiveProjects(projectsResult.value, states);
+        if (q) {
+          const normalizedQuery = q.toLowerCase();
+          data = data.filter((project) =>
+            typeof project?.name === 'string' && project.name.toLowerCase().includes(normalizedQuery));
+        }
       } else {
         data = await bexioRequest('GET', '/pr_project', q ? { search_term: q } : {}, null, req);
       }
@@ -1184,6 +1213,7 @@ if (require.main === module) {
 
 module.exports = {
   resolveStaticPath,
+  sanitizeUpstreamErrorBody,
   CONFIG,
   loadConfig,
   server,

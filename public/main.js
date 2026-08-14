@@ -422,36 +422,58 @@ function initProjectSearch() {
   });
 }
 
+function settledArray(result) {
+  return result?.status === 'fulfilled' && Array.isArray(result.value) ? result.value : [];
+}
+
+function resolveReferenceResults(results) {
+  return {
+    activities: settledArray(results[0]),
+    statuses: settledArray(results[1]),
+    projects: settledArray(results[2]),
+    selectableProjects: settledArray(results[3]),
+  };
+}
+
 // Load and cache the reference data: projects, activities, statuses.
 async function loadReferenceData() {
-  try {
-    const [acts, stats, projs, activeProjs] = await Promise.all([
+  const [activitiesResult, statusesResult, projectsResult, activeProjectsResult] =
+    await Promise.allSettled([
       fetchJson(API.activities),
       fetchJson(API.statuses),
       fetchJson(API.projects),
       fetchJson(API.activeProjects),
     ]);
-    activities = acts;
-    statuses = stats;
-    projects = projs;
-    selectableProjects = activeProjs;
-    populateSelect(document.getElementById('activity-select'), activities, 'name');
-    populateSelect(document.getElementById('status-select'), statuses, 'name');
-    // Populate the activity select in the multi‑day planner modal if present
-    const multiActSelect = document.getElementById('multi-activity-select');
-    if (multiActSelect) {
-      populateSelect(multiActSelect, activities, 'name');
-    }
-    // Populate datalist for backward compatibility if present
-    const dl = document.getElementById('project-list');
-    if (dl) {
-      populateProjectDatalist(dl, selectableProjects);
-    }
-    // Initialise custom search suggestions for projects
-    initProjectSearch();
-  } catch (err) {
-    console.error('Failed to load reference data:', err);
+
+  const resolved = resolveReferenceResults([
+    activitiesResult, statusesResult, projectsResult, activeProjectsResult,
+  ]);
+  activities = resolved.activities;
+  statuses = resolved.statuses;
+  projects = resolved.projects;
+  selectableProjects = resolved.selectableProjects;
+
+  if (activitiesResult.status === 'rejected') console.warn('Activity fallback lookup unavailable');
+  if (statusesResult.status === 'rejected') console.warn('Timesheet status lookup unavailable');
+  if (projectsResult.status === 'rejected') console.warn('Historical project fallback lookup unavailable');
+  if (activeProjectsResult.status === 'rejected') {
+    console.warn('Active project suggestions unavailable');
   }
+
+  populateSelect(document.getElementById('activity-select'), activities, 'name');
+  populateSelect(document.getElementById('status-select'), statuses, 'name');
+  // Populate the activity select in the multi‑day planner modal if present
+  const multiActSelect = document.getElementById('multi-activity-select');
+  if (multiActSelect) {
+    populateSelect(multiActSelect, activities, 'name');
+  }
+  // Populate datalist for backward compatibility if present
+  const dl = document.getElementById('project-list');
+  if (dl) {
+    populateProjectDatalist(dl, selectableProjects);
+  }
+  // Project search remains available but empty if active lookup failed.
+  initProjectSearch();
 }
 
 // Load packages for a given project ID and populate the package select.
@@ -549,26 +571,36 @@ function buildEventPresentation(ts, referenceData = {}) {
   const packagesById = referenceData.packageMap || packageMap;
   const project = findById(projectList, ts?.pr_project_id);
   const activity = findById(activityList, ts?.client_service_id);
-  const projectName = normalizeBexioText(project?.name || project?.title, { singleLine: true });
-  const activityName = normalizeBexioText(activity?.name || activity?.title, { singleLine: true });
+  const directProjectName = normalizeBexioText(ts?.project_name, { singleLine: true });
+  const fallbackProjectName = normalizeBexioText(project?.name || project?.title, { singleLine: true });
+  const projectName = directProjectName || fallbackProjectName;
+  const directActivityName = normalizeBexioText(ts?.activity_name, { singleLine: true });
+  const fallbackActivityName = normalizeBexioText(activity?.name || activity?.title, { singleLine: true });
+  const activityName = directActivityName || fallbackActivityName;
   const remark = normalizeBexioText(ts?.text);
   const packageName = normalizeBexioText(packagesById[ts?.pr_package_id], { singleLine: true });
   const isProjectActivity = activityName.toLocaleLowerCase('de-CH') === 'projekt durchführung';
+  const hasProjectId = ts?.pr_project_id !== null && ts?.pr_project_id !== undefined &&
+    String(ts.pr_project_id) !== '';
 
   let primary;
   let classification;
-  if (projectName) {
-    primary = packageName ? `${projectName} – ${packageName}` : projectName;
+  if (hasProjectId || projectName) {
+    primary = projectName || 'Projekt';
+    if (packageName) primary = `${primary} – ${packageName}`;
     classification = 'project';
   } else if (isProjectActivity) {
-    primary = `Projektarbeit · ${activityName}`;
+    primary = 'Projektarbeit';
     classification = 'project';
+  } else if (activityName.toLocaleLowerCase('de-CH') === 'intern') {
+    primary = 'Intern';
+    classification = 'internal';
   } else {
     primary = `Intern · ${activityName || 'Ohne Aktivität'}`;
     classification = 'internal';
   }
 
-  const detail = remark || (projectName ? activityName : '');
+  const detail = remark || (projectName && !isProjectActivity ? activityName : '');
   return {
     title: detail && detail !== primary ? `${primary}\n${detail}` : primary,
     classification,

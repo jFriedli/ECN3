@@ -8,7 +8,17 @@ const {
   createSession,
   signedSessionCookie,
   cookieAttributes,
+  sanitizeUpstreamErrorBody,
 } = require('../server');
+
+test('upstream diagnostics redact authentication material', () => {
+  const body = sanitizeUpstreamErrorBody(
+    '{"access_token":"secret-token","client_secret":"secret-client","message":"invalid"}',
+  );
+  assert.doesNotMatch(body, /secret-token|secret-client/);
+  assert.match(body, /\[REDACTED\]/);
+  assert.match(body, /invalid/);
+});
 
 function request(port, path, options = {}) {
   return new Promise((resolve, reject) => {
