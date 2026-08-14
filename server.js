@@ -1122,6 +1122,12 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
   }
 
   // Serve static files only from STATIC_ROOT.
+  if (!['GET', 'HEAD'].includes(req.method)) {
+    res.writeHead(405, { Allow: 'GET, HEAD' });
+    res.end('Method not allowed');
+    return;
+  }
+
   const filePath = resolveStaticPath(pathname);
 
   if (!filePath) {
