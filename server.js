@@ -499,6 +499,46 @@ function logUpstreamFailure(method, apiVersion, endpoint, response, body) {
   );
 }
 
+const SUPPORTED_BEXIO_API_VERSIONS = new Set(['2.0', '3.0']);
+
+function buildBexioUrl(version, endpoint, queryParams = {}) {
+  if (!SUPPORTED_BEXIO_API_VERSIONS.has(version)) {
+    throw new TypeError('Unsupported Bexio API version');
+  }
+  if (typeof endpoint !== 'string' || !endpoint.startsWith('/') || endpoint.startsWith('//') ||
+      endpoint.includes('\\') || endpoint.includes('\0') || endpoint.includes('?') ||
+      endpoint.includes('#') || endpoint.includes('@')) {
+    throw new TypeError('Invalid Bexio API endpoint');
+  }
+
+  const segments = endpoint.slice(1).split('/');
+  if (segments.some((segment) => segment.length === 0)) {
+    throw new TypeError('Invalid Bexio API endpoint path');
+  }
+  for (const segment of segments) {
+    let decoded;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch (_) {
+      throw new TypeError('Invalid encoding in Bexio API endpoint');
+    }
+    if (decoded === '.' || decoded === '..' || decoded.includes('/') || decoded.includes('\\') ||
+        decoded.includes('\0')) {
+      throw new TypeError('Invalid Bexio API endpoint path segment');
+    }
+  }
+
+  const url = new URL(endpoint.slice(1), `https://api.bexio.com/${version}/`);
+  if (url.protocol !== 'https:' || url.hostname !== 'api.bexio.com' || url.port !== '' ||
+      url.username !== '' || url.password !== '' || !url.pathname.startsWith(`/${version}/`)) {
+    throw new TypeError('Invalid Bexio API destination');
+  }
+  for (const [name, value] of Object.entries(queryParams || {})) {
+    if (value !== undefined && value !== null) url.searchParams.append(name, String(value));
+  }
+  return url;
+}
+
 // Helper to perform API requests to Bexio.
 async function bexioRequest(method, endpoint, queryParams = {}, body = null, req = null) {
   // Determine which access token to use (personal, session or OAuth).  When
@@ -512,10 +552,7 @@ async function bexioRequest(method, endpoint, queryParams = {}, body = null, req
     // If session retrieval fails, fall back to global token
     token = await getAccessToken();
   }
-  const baseUrl = 'https://api.bexio.com/2.0';
-  // Build query string.
-  const queryString = new URLSearchParams(queryParams).toString();
-  const url = `${baseUrl}${endpoint}${queryString ? '?' + queryString : ''}`;
+  const url = buildBexioUrl('2.0', endpoint, queryParams);
   const options = {
     method,
     headers: {
@@ -559,9 +596,7 @@ async function bexioRequestV3(method, endpoint, queryParams = {}, body = null, r
   } catch (err) {
     token = await getAccessToken();
   }
-  const baseUrl = 'https://api.bexio.com/3.0';
-  const queryString = new URLSearchParams(queryParams).toString();
-  const url = `${baseUrl}${endpoint}${queryString ? '?' + queryString : ''}`;
+  const url = buildBexioUrl('3.0', endpoint, queryParams);
   const options = {
     method,
     headers: {
@@ -1024,8 +1059,9 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
         res.end('Missing project id');
         return;
       }
+      const safeId = encodeURIComponent(String(id));
       try {
-        const data = await bexioRequest('GET', `/pr_project/${id}`, {}, null, req);
+        const data = await bexioRequest('GET', `/pr_project/${safeId}`, {}, null, req);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(data));
       } catch (err) {
@@ -1043,8 +1079,9 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
         res.end('Missing contact id');
         return;
       }
+      const safeId = encodeURIComponent(String(id));
       try {
-        const data = await bexioRequest('GET', `/contact/${id}`, {}, null, req);
+        const data = await bexioRequest('GET', `/contact/${safeId}`, {}, null, req);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(data));
       } catch (err) {
@@ -1062,6 +1099,7 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
         res.end('Missing project_id');
         return;
       }
+      const safeProjectId = encodeURIComponent(String(projectId));
       try {
         // Try the v3.0 project packages endpoint first.  This returns
         // packages for the given project.  If it fails (e.g. not found),
@@ -1069,7 +1107,7 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
         // duplicates are removed.  Log the packages for debugging.
         let data = [];
         try {
-          data = await bexioRequestV3('GET', `/projects/${projectId}/packages`, {}, null, req);
+          data = await bexioRequestV3('GET', `/projects/${safeProjectId}/packages`, {}, null, req);
         } catch (errV3) {
           // Fall back to v2.0 if v3.0 endpoint fails (e.g. 404 or not available)
           try {
@@ -1178,6 +1216,7 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
         error.statusCode = 400;
         throw error;
       }
+      const safeId = encodeURIComponent(String(id));
       const body = validateTimesheetBody(await parseBody(req));
       // Provide default user_id and allowable_bill if missing
       // Determine user id from request body or OAuth token or env
@@ -1204,7 +1243,7 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
       try {
         // Use POST to update an existing timesheet.  Bexio's API expects
         // timesheet updates via a POST request to /timesheet/{id}, not PUT.
-        const data = await bexioRequest('POST', `/timesheet/${id}`, {}, body, req);
+        const data = await bexioRequest('POST', `/timesheet/${safeId}`, {}, body, req);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(data));
       } catch (err) {
@@ -1218,7 +1257,8 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
         error.statusCode = 400;
         throw error;
       }
-      const data = await bexioRequest('DELETE', `/timesheet/${id}`, {}, null, req);
+      const safeId = encodeURIComponent(String(id));
+      const data = await bexioRequest('DELETE', `/timesheet/${safeId}`, {}, null, req);
       res.writeHead(204);
       res.end();
       return;
@@ -1262,6 +1302,8 @@ if (require.main === module) {
 
 module.exports = {
   resolveStaticPath,
+  buildBexioUrl,
+  validId,
   sanitizeUpstreamErrorBody,
   DEFAULT_BEXIO_SCOPES,
   CONFIG,
