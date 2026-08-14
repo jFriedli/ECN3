@@ -401,6 +401,48 @@ async function refreshAccessToken() {
 
 // Read static files into memory on startup for faster responses.
 const STATIC_ROOT = path.join(__dirname, 'public');
+
+function resolveStaticPath(requestPath) {
+  if (typeof requestPath !== 'string') return null;
+
+  let decodedPath;
+  try {
+    decodedPath = decodeURIComponent(requestPath);
+  } catch {
+    return null;
+  }
+
+  if (decodedPath.includes('\0')) {
+    return null;
+  }
+
+  // Normalize Windows-style separators as well, even though production is Linux.
+  decodedPath = decodedPath.replace(/\\/g, '/');
+
+  const relativePath =
+    decodedPath === '/' || decodedPath === ''
+      ? 'index.html'
+      : decodedPath.replace(/^\/+/, '');
+
+  const root = path.resolve(STATIC_ROOT);
+
+  // User-controlled input is intentionally resolved here, then immediately
+  // subjected to a canonical containment check below.
+  const candidate = path.resolve(root, relativePath); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+
+  const relativeToRoot = path.relative(root, candidate);
+
+  if (
+    relativeToRoot === '..' ||
+    relativeToRoot.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relativeToRoot)
+  ) {
+    return null;
+  }
+
+  return candidate;
+}
+
 const cache = {};
 
 function serveStatic(filePath, res) {
@@ -1079,29 +1121,15 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
     return;
   }
 
-  // Serve static files
-  if (!['GET', 'HEAD'].includes(req.method)) {
-    res.writeHead(405, { Allow: 'GET, HEAD' });
-    res.end('Method not allowed');
-    return;
-  }
-  let filePath = pathname;
-  if (filePath === '/' || filePath === '') {
-    filePath = '/index.html';
-  }
-  try {
-    filePath = decodeURIComponent(filePath);
-  } catch (_) {
-    res.writeHead(400);
-    res.end('Invalid path');
-    return;
-  }
-  filePath = path.resolve(STATIC_ROOT, `.${filePath}`);
-  if (filePath !== STATIC_ROOT && !filePath.startsWith(`${STATIC_ROOT}${path.sep}`)) {
-    res.writeHead(404);
+  // Serve static files only from STATIC_ROOT.
+  const filePath = resolveStaticPath(pathname);
+
+  if (!filePath) {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('Not found');
     return;
   }
+
   serveStatic(filePath, res);
 });
 
@@ -1115,6 +1143,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  resolveStaticPath,
   CONFIG,
   loadConfig,
   server,
