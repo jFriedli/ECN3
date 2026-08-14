@@ -89,9 +89,10 @@ const BEXIO_CLIENT_ID = process.env.BEXIO_CLIENT_ID || '';
 const BEXIO_CLIENT_SECRET = process.env.BEXIO_CLIENT_SECRET || '';
 const BEXIO_REDIRECT_URI = CONFIG.oauthRedirectUri;
 
-// Scopes requested during OAuth login.  Can be overridden via env.
-const BEXIO_SCOPES = process.env.BEXIO_SCOPES ||
-  'openid offline_access pr_project_show timesheet_show timesheet_edit client_service_show timesheet_status_show';
+// Scopes requested during OAuth login. Can be overridden via env.
+const DEFAULT_BEXIO_SCOPES =
+  'openid offline_access project_show timesheet_show timesheet_edit client_service_show timesheet_status_show';
+const BEXIO_SCOPES = process.env.BEXIO_SCOPES || DEFAULT_BEXIO_SCOPES;
 
 // Optional: default user ID for timesheet creation.  Set BEXIO_USER_ID in
 // .env to automatically assign the current user when creating timesheets.
@@ -483,12 +484,19 @@ function sanitizeUpstreamErrorBody(body) {
       '$1[REDACTED]');
 }
 
-function logUpstreamFailure(apiVersion, endpoint, response, body) {
-  console.error('Bexio upstream request failed', {
-    endpoint: `/${apiVersion}${endpoint}`,
-    status: response.status,
-    body: sanitizeUpstreamErrorBody(body),
-  });
+function sanitizeDiagnosticMessage(message) {
+  return sanitizeUpstreamErrorBody(typeof message === 'string' ? message : '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .slice(0, 500);
+}
+
+function logUpstreamFailure(method, apiVersion, endpoint, response, body) {
+  const sanitizedBody = sanitizeUpstreamErrorBody(body);
+  const detail = sanitizedBody ? `: ${sanitizedBody}` : '';
+  console.error(
+    `Bexio request failed: ${method} /${apiVersion}${endpoint} -> ` +
+    `${response.status} ${response.statusText}${detail}`,
+  );
 }
 
 // Helper to perform API requests to Bexio.
@@ -519,10 +527,17 @@ async function bexioRequest(method, endpoint, queryParams = {}, body = null, req
     options.headers['Content-Type'] = 'application/json';
     options.body = JSON.stringify(body);
   }
-  const response = await fetch(url, options);
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch (error) {
+    const reason = sanitizeUpstreamErrorBody(error?.message || 'network error');
+    console.error(`Bexio request failed: ${method} /2.0${endpoint} -> network error: ${reason}`);
+    throw new Error('Bexio API network request failed');
+  }
   if (!response.ok) {
     const text = await response.text();
-    logUpstreamFailure('2.0', endpoint, response, text);
+    logUpstreamFailure(method, '2.0', endpoint, response, text);
     throw new Error(
       `Bexio API error: ${response.status} ${response.statusText}`,
     );
@@ -558,10 +573,17 @@ async function bexioRequestV3(method, endpoint, queryParams = {}, body = null, r
     options.headers['Content-Type'] = 'application/json';
     options.body = JSON.stringify(body);
   }
-  const response = await fetch(url, options);
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch (error) {
+    const reason = sanitizeUpstreamErrorBody(error?.message || 'network error');
+    console.error(`Bexio request failed: ${method} /3.0${endpoint} -> network error: ${reason}`);
+    throw new Error('Bexio API v3 network request failed');
+  }
   if (!response.ok) {
     const text = await response.text();
-    logUpstreamFailure('3.0', endpoint, response, text);
+    logUpstreamFailure(method, '3.0', endpoint, response, text);
     throw new Error(
       `Bexio API v3 error: ${response.status} ${response.statusText}`,
     );
@@ -670,18 +692,43 @@ function isValidDateOnly(value) {
     date.getUTCDate() === day;
 }
 
-function findActiveProjectStateId(states) {
-  if (!Array.isArray(states)) return null;
-  const activeState = states.find((state) =>
-    typeof state?.name === 'string' && state.name.trim().toLowerCase() === 'active');
-  return activeState?.id ?? null;
+function findSelectableProjectStateIds(states) {
+  if (!Array.isArray(states)) return [];
+
+  const selectableNames = new Set([
+    'active',
+    'aktiv',
+    'open',
+    'offen',
+  ]);
+
+  return states
+    .filter((state) => {
+      if (typeof state?.name !== 'string') return false;
+
+      const normalizedName = state.name
+        .normalize('NFKC')
+        .trim()
+        .toLowerCase();
+
+      return selectableNames.has(normalizedName);
+    })
+    .map((state) => state.id)
+    .filter((id) => id !== null && id !== undefined);
 }
 
 function filterActiveProjects(projects, states) {
   if (!Array.isArray(projects)) return [];
-  const activeStateId = findActiveProjectStateId(states);
-  if (activeStateId === null) return [];
-  return projects.filter((project) => String(project?.pr_state_id) === String(activeStateId));
+
+  const selectableStateIds = new Set(
+    findSelectableProjectStateIds(states)
+  );
+
+  if (selectableStateIds.size === 0) return [];
+
+  return projects.filter((project) =>
+    selectableStateIds.has(project?.pr_state_id)
+  );
 }
 
 // Bexio orders timesheets by their top-level date. Tracking data is retained
@@ -939,9 +986,9 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
         if (projectsResult.status === 'rejected') throw projectsResult.reason;
         if (statesResult.status === 'rejected') throw statesResult.reason;
         const states = statesResult.value;
-        const activeStateId = findActiveProjectStateId(states);
-        if (activeStateId === null) {
-          throw new Error('Bexio did not return an Active project status');
+        const selectableStateIds = findSelectableProjectStateIds(states);
+        if (selectableStateIds.length === 0) {
+          throw new Error('Bexio did not return any selectable project statuses');
         }
         data = filterActiveProjects(projectsResult.value, states);
         if (q) {
@@ -1178,7 +1225,9 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
     }
   } catch (error) {
     const status = error.statusCode || (error.message === 'Not authenticated. Please login via /auth/login' ? 401 : 502);
-    if (status >= 500) console.error('Request failed');
+    if (status >= 500) {
+      console.error(`Request failed: ${sanitizeDiagnosticMessage(error?.message || 'Unknown error')}`);
+    }
     res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify({ error: status >= 500 ? 'Upstream service request failed' : error.message }));
     return;
@@ -1214,6 +1263,7 @@ if (require.main === module) {
 module.exports = {
   resolveStaticPath,
   sanitizeUpstreamErrorBody,
+  DEFAULT_BEXIO_SCOPES,
   CONFIG,
   loadConfig,
   server,
@@ -1222,7 +1272,7 @@ module.exports = {
   signedSessionCookie,
   cookieAttributes,
   fetchTimesheetsInRange,
-  findActiveProjectStateId,
+  findSelectableProjectStateIds,
   filterActiveProjects,
   getTimesheetDate,
   isValidDateOnly,

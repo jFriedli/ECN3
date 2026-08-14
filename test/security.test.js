@@ -73,6 +73,40 @@ test('security controls protect authentication, logout, CSRF, input, and headers
   assert.equal(authenticatedApi.status, 200);
   assert.deepEqual(JSON.parse(authenticatedApi.body), []);
 
+  const originalConsoleError = console.error;
+  const diagnostics = [];
+  console.error = (...args) => { diagnostics.push(args.map(String).join(' ')); };
+  global.fetch = async (url) => {
+    if (String(url).endsWith('/pr_project_state')) {
+      return new Response(
+        '{"message":"missing project scope","access_token":"leaked-token",' +
+        '"client_secret":"leaked-secret"}',
+        { status: 403, statusText: 'Forbidden' },
+      );
+    }
+    return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+  let activeProjectFailure;
+  try {
+    activeProjectFailure = await request(port, '/api/projects?active_only=true', {
+      headers: { Cookie: cookie },
+    });
+  } finally {
+    console.error = originalConsoleError;
+  }
+  assert.equal(activeProjectFailure.status, 502);
+  assert.deepEqual(JSON.parse(activeProjectFailure.body), { error: 'Upstream service request failed' });
+  assert.doesNotMatch(activeProjectFailure.body, /missing project scope|leaked-token|leaked-secret/);
+  const diagnosticText = diagnostics.join('\n');
+  assert.match(diagnosticText,
+    /Bexio request failed: GET \/2\.0\/pr_project_state -> 403 Forbidden: .*missing project scope/);
+  assert.doesNotMatch(diagnosticText, /leaked-token|leaked-secret|test-access-token|session_id/);
+
+  global.fetch = async () => new Response('[]', {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
+
   const crossSite = await request(port, '/api/timesheets/1', {
     method: 'DELETE',
     headers: { Cookie: cookie, Origin: 'https://attacker.example', 'Sec-Fetch-Site': 'cross-site' },
