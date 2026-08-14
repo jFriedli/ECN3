@@ -17,10 +17,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: '24'
           cache: npm
@@ -44,10 +44,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: '24'
 
@@ -62,10 +62,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       - name: Review dependency changes
-        uses: actions/dependency-review-action@v5
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294
         with:
           fail-on-severity: high
 
@@ -80,12 +80,12 @@ jobs:
 
     steps:
       - name: Checkout full history
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           fetch-depth: 0
 
       - name: Scan for secrets
-        uses: gitleaks/gitleaks-action@v3
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -99,7 +99,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       - name: Semgrep CE
         run: semgrep scan --config auto --error
@@ -111,10 +111,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       - name: Trivy repository scan
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         with:
           scan-type: fs
           scan-ref: .
