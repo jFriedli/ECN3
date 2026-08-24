@@ -94,8 +94,12 @@ const DEFAULT_BEXIO_SCOPES =
   'openid offline_access project_show timesheet_show timesheet_edit client_service_show timesheet_status_show';
 const BEXIO_SCOPES = process.env.BEXIO_SCOPES || DEFAULT_BEXIO_SCOPES;
 
-// Optional: default user ID for timesheet creation.  Set BEXIO_USER_ID in
-// .env to automatically assign the current user when creating timesheets.
+// Optional: Bexio user ID used only in personal-token (BEXIO_TOKEN) single-
+// user development mode, where there is no OAuth session to resolve a user
+// from. Never used as a fallback for OAuth sessions - each session resolves
+// its own Bexio user_id via GET /3.0/users/me at login (see
+// resolveTimesheetUserId), so one ECN3 user can never accidentally submit
+// hours under another user's Bexio identity.
 const BEXIO_USER_ID = process.env.BEXIO_USER_ID || '';
 const IS_PRODUCTION = CONFIG.isProduction;
 const SESSION_IDLE_MS = CONFIG.sessionIdleMs;
@@ -626,6 +630,71 @@ async function bexioRequestV3(method, endpoint, queryParams = {}, body = null, r
   return response.json();
 }
 
+// Resolve the authenticated user's numeric, per‑company Bexio user id via
+// GET /3.0/users/me. This is the endpoint Bexio's own documentation
+// recommends for identifying "who is this token for", since the OIDC
+// sub/login_id claims are a UUID in a different identity space than the
+// integer user_id used by /2.0 endpoints like /timesheet. Returns null
+// (rather than throwing) on any failure so callers can treat the user as
+// unresolved instead of guessing.
+async function resolveBexioUser(accessToken) {
+  let response;
+  try {
+    response = await fetch('https://api.bexio.com/3.0/users/me', {
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+    });
+  } catch (error) {
+    const reason = sanitizeUpstreamErrorBody(error?.message || 'network error');
+    console.error(`Bexio request failed: GET /3.0/users/me -> network error: ${reason}`);
+    return null;
+  }
+  if (!response.ok) {
+    const text = await response.text();
+    logUpstreamFailure('GET', '3.0', '/users/me', response, text);
+    return null;
+  }
+  const data = await response.json();
+  const id = data && data.id;
+  if (!(typeof id === 'number' && Number.isSafeInteger(id) && id > 0)) return null;
+  return { userId: id, email: typeof data?.email === 'string' ? data.email : null };
+}
+
+// Determine the Bexio user_id to attach to a timesheet create/update
+// request. The resolved, session-verified identity always wins; a client
+// supplied user_id is never trusted (that would let one ECN3 user submit
+// hours as another). BEXIO_USER_ID only applies in personal-token
+// (BEXIO_TOKEN) single-user development mode, which production forbids.
+function resolveTimesheetUserId(req) {
+  const session = getSession(req);
+  if (session) {
+    if (session.user_id) return session.user_id;
+    const error = new Error(
+      'Your Bexio account could not be linked to a Bexio user. Please contact an administrator.',
+    );
+    error.statusCode = 409;
+    throw error;
+  }
+  if (BEXIO_TOKEN && BEXIO_USER_ID) return BEXIO_USER_ID;
+  const error = new Error('No Bexio user is configured for this request.');
+  error.statusCode = 409;
+  throw error;
+}
+
+// Emit a safe diagnostic line for a failed timesheet create/update. Includes
+// only identifiers useful for tracing which user/project failed and why -
+// never tokens, cookies, or other credentials.
+function logTimesheetFailure(req, body, err) {
+  const session = getSession(req);
+  const identity = (session && session.user_email) || 'unresolved-session';
+  console.error(
+    'Timesheet submission failed: ' +
+    `authenticated_user=${identity} ` +
+    `resolved_bexio_user_id=${body && body.user_id !== undefined ? body.user_id : 'none'} ` +
+    `project_id=${body && body.pr_project_id ? body.pr_project_id : 'none'} ` +
+    `bexio_error=${sanitizeDiagnosticMessage(err && err.message)}`,
+  );
+}
+
 // Parse JSON body of request.
 function parseBody(req, maxBytes = 64 * 1024) {
   return new Promise((resolve, reject) => {
@@ -681,7 +750,7 @@ function validateTimesheetBody(body) {
       throw error;
     }
   }
-  for (const field of ['pr_project_id', 'pr_package_id', 'contact_id', 'sub_contact_id', 'user_id']) {
+  for (const field of ['pr_project_id', 'pr_package_id', 'contact_id', 'sub_contact_id']) {
     if (!validId(body[field], true)) {
       const error = new Error(`${field} must be a numeric ID or empty`);
       error.statusCode = 400;
@@ -711,7 +780,10 @@ function validateTimesheetBody(body) {
     tracking: { type: 'range', start: tracking.start, end: tracking.end },
     contact_id: body.contact_id || null,
     sub_contact_id: body.sub_contact_id || null,
-    ...(body.user_id ? { user_id: body.user_id } : {}),
+    // user_id is intentionally not accepted from the client: it is always
+    // derived server-side from the authenticated session (see
+    // resolveTimesheetUserId) so one ECN3 user can never submit hours
+    // under another user's Bexio identity.
     ...(typeof body.allowable_bill === 'boolean' ? { allowable_bill: body.allowable_bill } : {}),
   };
 }
@@ -897,34 +969,36 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
         refresh_token: json.refresh_token,
         expires_at: Date.now() + (json.expires_in || 3600) * 1000 - 5 * 60 * 1000,
         user_id: null,
+        user_email: null,
       });
       // Do not update global oauthTokens here.  Per‑user sessions should be
       // independent, and storing the token globally would cause all users
       // to share the same credentials.  The oauthTokens object is only
       // updated when a personal API token is used or when explicitly
       // configured via environment variables.
-      // Attempt to fetch user info to determine the current user ID.  This is optional
-      // and may fail silently.  The user info endpoint returns the subject (sub)
-      // identifier or id for the authenticated user.  The user_id is stored on
-      // oauthTokens.user_id and later used when creating timesheets.
+      // Resolve the numeric, per‑company Bexio user id for this session via
+      // GET /3.0/users/me.  The OIDC `sub`/`id` claims from auth.bexio.com
+      // are a UUID identifying the user within Bexio's identity provider,
+      // not the integer `user_id` the REST API expects (see Bexio's
+      // auth.bexio.com migration guide). If resolution fails, leave
+      // session.user_id null rather than guessing — timesheet creation will
+      // then fail loudly instead of silently using the wrong identity.
       try {
-        const userInfoRes = await fetch(
-          'https://auth.bexio.com/realms/bexio/protocol/openid-connect/userinfo',
-          {
-            headers: { Authorization: `Bearer ${json.access_token}` },
-          },
-        );
-        if (userInfoRes.ok) {
-          const userInfo = await userInfoRes.json();
-          // Prefer explicit id if available, otherwise use sub
-          const uid = userInfo.id || userInfo.sub || null;
-      // Store the user_id in the session.  We do not update the global
-      // oauthTokens.user_id to avoid leaking the user identity across
-      // sessions.
-      sessions[newSessionId].user_id = uid;
+        const resolved = await resolveBexioUser(json.access_token);
+        if (resolved) {
+          sessions[newSessionId].user_id = resolved.userId;
+          sessions[newSessionId].user_email = resolved.email;
+        } else {
+          console.warn('Could not resolve Bexio user for new session via /3.0/users/me');
         }
+        console.info(
+          'Timesheet identity mapping: ' +
+          `authenticated_user=${resolved && resolved.email ? resolved.email : 'unknown'} ` +
+          `bexio_user_id=${resolved ? resolved.userId : 'unresolved'} ` +
+          'mapping_source=bexio_users_me',
+        );
       } catch (userErr) {
-        console.warn('Failed to fetch user info:', userErr.message);
+        console.warn('Failed to resolve Bexio user:', sanitizeDiagnosticMessage(userErr.message));
       }
       // Set a cookie with the new session id.  HttpOnly prevents client side
       // JavaScript from reading the cookie.  The cookie lasts for the same
@@ -1170,30 +1244,7 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
       return;
     } else if (pathname === '/api/timesheets' && req.method === 'POST') {
       const body = validateTimesheetBody(await parseBody(req));
-      // If user_id not provided, use default from environment.  Some Bexio
-      // installations require user_id and allowable_bill fields to be set when
-      // creating timesheets.  Provide reasonable defaults if missing.
-      // Determine user id from OAuth token or environment.  Use in order of precedence:
-      // 1. Provided in request body
-      // 2. oauthTokens.user_id captured during OAuth flow
-      // 3. BEXIO_USER_ID environment variable
-      if (!body.user_id) {
-        // Use the user_id from the current session if available
-        const session = getSession(req);
-        if (session && session.user_id) {
-          body.user_id = session.user_id;
-        } else if (oauthTokens.user_id) {
-          // Fall back to the user_id captured from the first OAuth login only if
-          // no session user_id exists.  Note: oauthTokens.user_id is no longer
-          // updated on subsequent logins.
-          body.user_id = oauthTokens.user_id;
-        } else if (BEXIO_USER_ID) {
-          body.user_id = BEXIO_USER_ID;
-        }
-      }
-      // Convert user_id to a number if it's a numeric string.  Bexio API
-      // expects user_id to be an integer.  If user_id is non-numeric, leave
-      // as-is.  This prevents errors like "user_id: Diese Eingabe ist nicht korrekt".
+      body.user_id = resolveTimesheetUserId(req);
       if (typeof body.user_id === 'string' && /^\d+$/.test(body.user_id)) {
         body.user_id = parseInt(body.user_id, 10);
       }
@@ -1205,7 +1256,7 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
         res.writeHead(201, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(data));
       } catch (err) {
-        // Forward error details to client
+        logTimesheetFailure(req, body, err);
         throw err;
       }
       return;
@@ -1218,22 +1269,7 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
       }
       const safeId = encodeURIComponent(String(id));
       const body = validateTimesheetBody(await parseBody(req));
-      // Provide default user_id and allowable_bill if missing
-      // Determine user id from request body or OAuth token or env
-      if (!body.user_id) {
-        // Use the user_id from the current session if available
-        const session = getSession(req);
-        if (session && session.user_id) {
-          body.user_id = session.user_id;
-        } else if (oauthTokens.user_id) {
-          // Fall back to the user_id captured from the first OAuth login only
-          body.user_id = oauthTokens.user_id;
-        } else if (BEXIO_USER_ID) {
-          body.user_id = BEXIO_USER_ID;
-        }
-      }
-      // Convert user_id to a number if it's a numeric string.  Bexio API
-      // expects user_id to be an integer.  Leave non-numeric values unchanged.
+      body.user_id = resolveTimesheetUserId(req);
       if (typeof body.user_id === 'string' && /^\d+$/.test(body.user_id)) {
         body.user_id = parseInt(body.user_id, 10);
       }
@@ -1247,6 +1283,7 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(data));
       } catch (err) {
+        logTimesheetFailure(req, body, err);
         throw err;
       }
       return;
@@ -1318,4 +1355,6 @@ module.exports = {
   filterActiveProjects,
   getTimesheetDate,
   isValidDateOnly,
+  resolveBexioUser,
+  resolveTimesheetUserId,
 };
