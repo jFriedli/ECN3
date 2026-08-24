@@ -34,10 +34,6 @@ const packageMap = Object.create(null);
 // Store the total hours booked per day for the current view.  Keys are ISO
 // dates (YYYY-MM-DD) and values are the number of hours booked on that day.
 let dailyTotals = {};
-// Default user ID derived from existing timesheets.  When saving a new or
-// updated timesheet, include this value to satisfy Bexio's requirement for
-// user_id.  It will be set the first time events are fetched.
-let defaultUserId = null;
 
 // When true, suppress automatic actions triggered by programmatic
 // changes to the project input (such as loading packages or contact
@@ -152,8 +148,8 @@ function closeMultiModal() {
 // Save multi‑day entries.  Creates a time entry for each weekday between
 // the selected start and end dates (inclusive).  Each entry covers
 // 08:00–16:00 (8 hours).  Uses the selected activity and the default
-// status "Erledigt".  If defaultUserId is known, includes it in the
-// payload.
+// status "Erledigt". The server attaches user_id from the authenticated
+// session, so it is not included here.
 async function saveMultiEntries(event) {
   if (event) event.preventDefault();
   const startVal = document.getElementById('multi-start-date')?.value;
@@ -201,7 +197,6 @@ async function saveMultiEntries(event) {
         },
         contact_id: null,
         sub_contact_id: null,
-        ...(defaultUserId ? { user_id: defaultUserId } : {}),
       };
       entries.push(payload);
     }
@@ -675,24 +670,6 @@ async function fetchEvents(fetchInfo) {
     if (!Array.isArray(timesheets)) {
       throw new TypeError('Expected /api/timesheets to return an array');
     }
-    // Determine the default user ID from the returned timesheets if not already set.
-    try {
-      if (!defaultUserId && Array.isArray(timesheets) && timesheets.length > 0) {
-        // Find the first numeric user_id in the array.  Bexio timesheets
-        // typically include user_id as a number identifying the user who
-        // created the entry.  Using the first one ensures we have a valid
-        // default for subsequent POST/PUT requests.
-        for (const ts of timesheets) {
-          const uid = ts.user_id;
-          if (uid !== undefined && uid !== null && !isNaN(parseInt(uid))) {
-            defaultUserId = uid;
-            break;
-          }
-        }
-      }
-    } catch (e) {
-      // ignore errors setting defaultUserId
-    }
     let events = timesheets
       .map(timesheetToEvent)
       .filter((ev) => ev && ev.start);
@@ -879,11 +856,8 @@ async function saveTimesheet(event) {
     // the secondary contact (contact person) as per Bexio API.
     contact_id: contactIdVal || null,
     sub_contact_id: subContactIdVal || null,
-    // If we have derived a default user ID, include it in the payload.  This
-    // satisfies Bexio's requirement for a numeric user_id when creating or
-    // updating timesheets.  If defaultUserId is null, omit the property to
-    // allow the server fallback to apply.
-    ...(defaultUserId ? { user_id: defaultUserId } : {}),
+    // user_id is not set here: the server always attaches the user_id
+    // resolved from the authenticated session, ignoring any client value.
   };
   try {
     if (id) {
@@ -1024,8 +998,6 @@ function initCalendar() {
           start: ev.start.toISOString(),
           end: ev.end ? ev.end.toISOString() : null,
         },
-        // Include default user ID if available
-        ...(defaultUserId ? { user_id: defaultUserId } : {}),
       };
       try {
         // Use POST to update existing timesheet as per Bexio API.
@@ -1055,8 +1027,6 @@ function initCalendar() {
           start: ev.start.toISOString(),
           end: ev.end ? ev.end.toISOString() : null,
         },
-        // Include default user ID if available
-        ...(defaultUserId ? { user_id: defaultUserId } : {}),
       };
       try {
         // Use POST to update existing timesheet as per Bexio API.
