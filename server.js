@@ -686,10 +686,11 @@ function resolveTimesheetUserId(req) {
 function logTimesheetFailure(req, body, err) {
   const session = getSession(req);
   const identity = (session && session.user_email) || 'unresolved-session';
+  const resolvedBexioUserIdState = body && body.user_id !== undefined ? 'present' : 'none';
   console.error(
     'Timesheet submission failed: ' +
     `authenticated_user=${identity} ` +
-    `resolved_bexio_user_id=${body && body.user_id !== undefined ? body.user_id : 'none'} ` +
+    `resolved_bexio_user_id=${resolvedBexioUserIdState} ` +
     `project_id=${body && body.pr_project_id ? body.pr_project_id : 'none'} ` +
     `bexio_error=${sanitizeDiagnosticMessage(err && err.message)}`,
   );
