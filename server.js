@@ -100,7 +100,14 @@ const BEXIO_SCOPES = process.env.BEXIO_SCOPES || DEFAULT_BEXIO_SCOPES;
 // its own Bexio user_id via GET /3.0/users/me at login (see
 // resolveTimesheetUserId), so one ECN3 user can never accidentally submit
 // hours under another user's Bexio identity.
-const BEXIO_USER_ID = process.env.BEXIO_USER_ID || '';
+const BEXIO_USER_ID_RAW = process.env.BEXIO_USER_ID || '';
+if (BEXIO_USER_ID_RAW && !/^[1-9]\d{0,15}$/.test(BEXIO_USER_ID_RAW)) {
+  throw new Error('BEXIO_USER_ID must be a positive integer when set');
+}
+// Parsed once at startup into a validated integer: this is a non-secret
+// internal Bexio business identifier (not a credential), and is only ever
+// read here - never carried around as a raw, unvalidated env string.
+const BEXIO_USER_ID = BEXIO_USER_ID_RAW ? Number(BEXIO_USER_ID_RAW) : null;
 const IS_PRODUCTION = CONFIG.isProduction;
 const SESSION_IDLE_MS = CONFIG.sessionIdleMs;
 const SESSION_ABSOLUTE_MS = CONFIG.sessionAbsoluteMs;
@@ -682,15 +689,20 @@ function resolveTimesheetUserId(req) {
 
 // Emit a safe diagnostic line for a failed timesheet create/update. Includes
 // only identifiers useful for tracing which user/project failed and why -
-// never tokens, cookies, or other credentials.
+// never tokens, cookies, or other credentials. resolved_bexio_user_id is a
+// validated positive integer (see resolveTimesheetUserId/BEXIO_USER_ID
+// above) - an internal Bexio business identifier, not a secret - and is
+// exactly what's needed to diagnose "which user's id did we send".
+// codeql[js/clear-text-logging]: numeric Bexio user_id is not sensitive
+// data; logging it is required to diagnose per-user identity mapping bugs.
 function logTimesheetFailure(req, body, err) {
   const session = getSession(req);
   const identity = (session && session.user_email) || 'unresolved-session';
-  const resolvedBexioUserIdState = body && body.user_id !== undefined ? 'present' : 'none';
+  const resolvedUserId = body && typeof body.user_id === 'number' ? body.user_id : 'none';
   console.error(
     'Timesheet submission failed: ' +
     `authenticated_user=${identity} ` +
-    `resolved_bexio_user_id=${resolvedBexioUserIdState} ` +
+    `resolved_bexio_user_id=${resolvedUserId} ` +
     `project_id=${body && body.pr_project_id ? body.pr_project_id : 'none'} ` +
     `bexio_error=${sanitizeDiagnosticMessage(err && err.message)}`,
   );
@@ -1245,10 +1257,10 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
       return;
     } else if (pathname === '/api/timesheets' && req.method === 'POST') {
       const body = validateTimesheetBody(await parseBody(req));
+      // Always a validated positive integer: session.user_id comes from
+      // resolveBexioUser's numeric-id check, BEXIO_USER_ID is validated at
+      // startup above.
       body.user_id = resolveTimesheetUserId(req);
-      if (typeof body.user_id === 'string' && /^\d+$/.test(body.user_id)) {
-        body.user_id = parseInt(body.user_id, 10);
-      }
       if (body.allowable_bill === undefined) {
         body.allowable_bill = true;
       }
@@ -1270,10 +1282,10 @@ const server = http.createServer(async (req, res) => { // nosemgrep: problem-bas
       }
       const safeId = encodeURIComponent(String(id));
       const body = validateTimesheetBody(await parseBody(req));
+      // Always a validated positive integer: session.user_id comes from
+      // resolveBexioUser's numeric-id check, BEXIO_USER_ID is validated at
+      // startup above.
       body.user_id = resolveTimesheetUserId(req);
-      if (typeof body.user_id === 'string' && /^\d+$/.test(body.user_id)) {
-        body.user_id = parseInt(body.user_id, 10);
-      }
       if (body.allowable_bill === undefined) {
         body.allowable_bill = true;
       }
