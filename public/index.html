@@ -121,6 +121,15 @@
     .modal textarea {
       resize: vertical;
     }
+    .modal label.checkbox-label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .modal input[type="checkbox"] {
+      width: auto;
+      margin: 0;
+    }
     .modal-buttons {
       margin-top: 15px;
       text-align: right;
@@ -392,6 +401,10 @@
             </select>
             <label for="remark-input">Remark</label>
             <textarea id="remark-input" rows="3"></textarea>
+            <label for="allowable-bill-input" class="checkbox-label">
+              <input type="checkbox" id="allowable-bill-input" checked>
+              Billable
+            </label>
           </div>
           <!-- Right column: customer and contact person information -->
           <div class="modal-right">

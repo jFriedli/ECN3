@@ -652,6 +652,7 @@ function timesheetToEvent(ts, referenceData) {
       status_id: ts.status_id || '',
       remark: presentation.remark,
       classification: presentation.classification,
+      allowable_bill: ts.allowable_bill !== false,
     },
   };
 }
@@ -799,6 +800,7 @@ async function openModal(data) {
   document.getElementById('package-select').value = data.pr_package_id || '';
   document.getElementById('status-select').value = data.status_id || '';
   document.getElementById('remark-input').value = data.remark || '';
+  document.getElementById('allowable-bill-input').checked = data.allowable_bill !== false;
   // Show delete button only when editing an existing entry
   const deleteBtn = document.getElementById('delete-btn');
   if (data.id) {
@@ -833,6 +835,7 @@ async function saveTimesheet(event) {
   const remark = document.getElementById('remark-input').value.trim();
   const contactIdVal = document.getElementById('contact-id').value;
   const subContactIdVal = document.getElementById('sub-contact-id').value;
+  const allowableBill = document.getElementById('allowable-bill-input').checked;
   // Require start and end times, activity and status.  Project is optional.
   if (!startStr || !endStr || !clientServiceId || !statusId) {
     alert('Please specify start and end time, activity and status.');
@@ -856,6 +859,7 @@ async function saveTimesheet(event) {
     // the secondary contact (contact person) as per Bexio API.
     contact_id: contactIdVal || null,
     sub_contact_id: subContactIdVal || null,
+    allowable_bill: allowableBill,
     // user_id is not set here: the server always attaches the user_id
     // resolved from the authenticated session, ignoring any client value.
   };
@@ -962,6 +966,7 @@ function initCalendar() {
         pr_package_id: '',
         status_id: '',
         remark: '',
+        allowable_bill: true,
       });
       // After selecting a slot, scroll so midday (12:00) is roughly centred
       if (calendar) {
@@ -981,6 +986,7 @@ function initCalendar() {
         pr_package_id: ev.extendedProps.pr_package_id || '',
         status_id: ev.extendedProps.status_id || '',
         remark: ev.extendedProps.remark || '',
+        allowable_bill: ev.extendedProps.allowable_bill !== false,
       });
     },
     eventDrop: async (info) => {
@@ -993,6 +999,7 @@ function initCalendar() {
         pr_package_id: ev.extendedProps.pr_package_id || '',
         status_id: ev.extendedProps.status_id || '',
         text: ev.extendedProps.remark || '',
+        allowable_bill: ev.extendedProps.allowable_bill !== false,
         tracking: {
           type: 'range',
           start: ev.start.toISOString(),
@@ -1022,6 +1029,7 @@ function initCalendar() {
         pr_package_id: ev.extendedProps.pr_package_id || '',
         status_id: ev.extendedProps.status_id || '',
         text: ev.extendedProps.remark || '',
+        allowable_bill: ev.extendedProps.allowable_bill !== false,
         tracking: {
           type: 'range',
           start: ev.start.toISOString(),
